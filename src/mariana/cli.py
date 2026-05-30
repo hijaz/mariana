@@ -81,6 +81,14 @@ def _query_thread_id(query: str) -> str:
     return hashlib.md5(query.strip().lower().encode()).hexdigest()[:16]
 
 
+_HIGH_QUALITY_DOMAINS = {
+    "wikipedia.org", "iaea.org", "energy.gov", "iter.org",
+    "nature.com", "science.org", "aps.org", "nasa.gov",
+    "pubmed.ncbi.nlm.nih.gov", "arxiv.org", "doi.org",
+    "scholar.google.com", "britannica.com", "nist.gov",
+}
+
+
 def _print_session_summary(state: dict, elapsed: float, report_path: Path | None = None) -> None:
     sub_questions = state.get("sub_questions", [])
     answered = [sq for sq in sub_questions if isinstance(sq, SubQuestion) and sq.answered]
@@ -89,17 +97,21 @@ def _print_session_summary(state: dict, elapsed: float, report_path: Path | None
         len([r for r in sq.results if len(r.content or "") > 200])
         for sq in sub_questions if isinstance(sq, SubQuestion)
     )
-    domains = {
-        urlparse(r.url).netloc.replace("www.", "")
-        for sq in sub_questions if isinstance(sq, SubQuestion)
-        for r in sq.results
-    }
+    all_results = [
+        r for sq in sub_questions if isinstance(sq, SubQuestion) for r in sq.results
+    ]
+    domains = {urlparse(r.url).netloc.replace("www.", "") for r in all_results}
+    authority_count = sum(
+        1 for r in all_results
+        if any(hq in r.url for hq in _HIGH_QUALITY_DOMAINS)
+    )
     llm_calls = state.get("llm_call_count", 0)
 
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_row("Sections completed", f"{len(answered)} / {len(sub_questions)}")
     table.add_row("Sources scraped", f"{total_sources} ({usable_sources} usable)")
     table.add_row("Unique domains", str(len(domains)))
+    table.add_row("Authority sources", str(authority_count))
     table.add_row("LLM calls", str(llm_calls))
     table.add_row("Total time", f"{elapsed:.0f}s")
     if report_path:

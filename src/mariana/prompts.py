@@ -121,17 +121,34 @@ CONCLUSION_PROMPT = ChatPromptTemplate.from_messages([
 
 ORCHESTRATOR_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "You are a research architect. Generate a structured table of contents for a "
-     "research report.\n"
-     "Output ONLY valid JSON matching this schema exactly:\n"
-     '{{"title": "...", "sections": [{{"heading": "...", "search_queries": ["query1", "query2"]}}]}}\n'
+     "You are a research document planner for a specific topic.\n"
+     "Generate a focused research outline as JSON.\n"
+     "Output ONLY valid JSON. No markdown. No backticks. No explanation.\n"
+     "\n"
+     "Schema:\n"
+     '{{"title": "string", "sections": [{{"heading": "string", "queries": ["string", "string"]}}]}}\n'
+     "\n"
      "RULES:\n"
-     "- 3-5 sections, each with 2 search queries\n"
-     "- Headings must be short noun phrases (3-6 words), not questions\n"
-     "- Search queries must be 3-7 plain words with no punctuation or markdown\n"
-     "- No backticks, no code fences, no extra keys\n"
-     "- Output raw JSON only"),
-    ("human", "Research topic: {query}\n\nKnown gaps to address: {gaps}"),
+     "- Exactly 3 to 4 sections. No more.\n"
+     "- Every heading must contain the core topic words from the question\n"
+     "- Every search query must contain the core topic words\n"
+     "- Queries: 4-7 words, no markdown, no punctuation, no backticks\n"
+     "- Do NOT use generic headings like Introduction, Overview, Background,\n"
+     "  Challenges, Applications, Future Directions by themselves\n"
+     "\n"
+     "EXAMPLE for topic 'How does photosynthesis work':\n"
+     '{{"title": "How Photosynthesis Works", "sections": ['
+     '{{"heading": "Photosynthesis Chemical Reactions", '
+     '"queries": ["photosynthesis light dark reactions mechanism", '
+     '"chlorophyll energy conversion ATP synthesis"]}},'
+     '{{"heading": "Photosynthesis in Different Plant Types", '
+     '"queries": ["C3 C4 CAM photosynthesis comparison plants", '
+     '"photosynthesis efficiency tropical desert plants"]}},'
+     '{{"heading": "Photosynthesis Research and Applications", '
+     '"queries": ["artificial photosynthesis solar energy research", '
+     '"photosynthesis crop yield improvement science"]}}'
+     ']}}'),
+    ("human", "Research question: {query}"),
 ])
 
 REPORT_PROMPT = ChatPromptTemplate.from_messages([

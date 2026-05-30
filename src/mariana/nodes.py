@@ -136,25 +136,59 @@ def _unique_query(query: str, used: set) -> str:
     return query
 
 
-def _chunk_content(text: str) -> list[str]:
-    """Split long text into overlapping chunks of CHUNK_SIZE chars."""
-    if len(text) <= CHUNK_SIZE:
-        return [text]
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = min(start + CHUNK_SIZE, len(text))
-        # Try to break at sentence boundary
-        if end < len(text):
-            last_period = text.rfind(".", start + int(CHUNK_SIZE * 0.6), end)
-            if last_period > start + int(CHUNK_SIZE * 0.6):
-                end = last_period + 1
-        chunks.append(text[start:end])
-        start = end - CHUNK_OVERLAP
-    return chunks
+def _extract_topic_keywords(query: str) -> list[str]:
+    """Return the most content-bearing words from the research query."""
+    QUERY_STOP = {
+        'how', 'does', 'do', 'what', 'why', 'when', 'where', 'is', 'are',
+        'the', 'a', 'an', 'and', 'or', 'of', 'in', 'to', 'for', 'work',
+        'works', 'explain', 'describe', 'tell', 'me', 'about', 'can', 'will',
+    }
+    words = re.findall(r'\b[a-zA-Z]{3,}\b', query.lower())
+    return [w for w in words if w not in QUERY_STOP][:3]
 
 
-# ── LLM call helpers (wrapped with retry) ────────────────────────────────────
+def _inject_topic(search_query: str, topic_keywords: list[str]) -> str:
+    """Prepend the primary topic keyword if the query contains none."""
+    query_lower = search_query.lower()
+    if any(kw in query_lower for kw in topic_keywords):
+        return search_query
+    prefix = topic_keywords[0] if topic_keywords else ""
+    return f"{prefix} {search_query}".strip() if prefix else search_query
+
+
+_GENERIC_HEADINGS = {
+    'introduction', 'overview', 'background', 'conclusion',
+    'challenges', 'applications', 'future directions', 'current research',
+    'fundamental physics', 'summary', 'history', 'related work',
+    'potential applications', 'future directions research',
+    'challenges and obstacles', 'current research developments',
+}
+
+
+def _parse_toc_json(text: str, query: str) -> dict:
+    """Parse orchestrator JSON output, hard-capping sections and normalising field names."""
+    text = re.sub(r'```(?:json)?', '', text).strip().rstrip('`').strip()
+    try:
+        toc = json.loads(text)
+    except json.JSONDecodeError:
+        return {"title": query.title(), "sections": []}
+    # Normalise 'queries' → 'search_queries' (new schema uses 'queries')
+    for section in toc.get("sections", []):
+        if "queries" in section and "search_queries" not in section:
+            section["search_queries"] = section.pop("queries")
+    # Hard cap — never more than max_sections
+    cfg = load_config()
+    toc["sections"] = toc.get("sections", [])[:cfg.max_sections]
+    return toc
+
+
+def _sources_are_on_topic(sources: list, topic_keywords: list[str]) -> bool:
+    """Return True if any source contains at least one topic keyword in the first 500 chars."""
+    combined = " ".join(r.content[:500] for r in sources if r.content).lower()
+    return any(kw in combined for kw in topic_keywords)
+
+
+
 
 def _inc_llm(state: dict) -> None:
     """Increment llm_call_count in state (in-place, best-effort)."""
@@ -201,18 +235,20 @@ def _llm_extract_chunk(question: str, domain: str, content: str) -> str:
     return _render_llm_output(get_summarizer_llm().generate_prompt([prompt])).strip()
 
 
-def _extract_from_source(source: SearchResult, question: str) -> str:
-    """Extract key points from one source, chunked if long."""
+def _extract_from_source(source: SearchResult, question: str) -> tuple[str, int]:
+    """Extract key points from one source, chunked if long. Returns (text, llm_calls)."""
     chunks = _chunk_content(source.content or "")
     domain = urlparse(source.url).netloc.replace("www.", "")
     points = []
+    calls = 0
     for chunk in chunks:
         point = _llm_extract_chunk(question, domain, chunk)
+        calls += 1
         if point and "NOT RELEVANT" not in point.upper() and len(point) > 20:
             points.append(point)
     if not points:
-        return ""
-    return " ".join(points)
+        return "", calls
+    return " ".join(points), calls
 
 
 @with_llm_retry
@@ -252,10 +288,9 @@ def _llm_exec_summary(query: str, summary_inputs: str) -> str:
 
 
 @with_llm_retry
-def _llm_orchestrate(query: str, gaps: str) -> str:
+def _llm_orchestrate(query: str) -> str:
     prompt = ORCHESTRATOR_PROMPT.format_prompt(
         query=truncate_for_llm(query, "query"),
-        gaps=truncate_for_llm(gaps, "gaps"),
     )
     return _render_llm_output(get_planner_llm().generate_prompt([prompt])).strip()
 
@@ -266,55 +301,69 @@ def orchestrator_node(state: dict) -> dict:
     """Generate a structured Table of Contents with pre-validated search queries."""
     query = state.get("query", "")
     gaps = state.get("gaps", []) or []
-    gaps_text = "\n".join(f"- {gap}" for gap in gaps) if gaps else "None yet"
     used_queries: set = set(state.get("used_queries") or set())
+    cfg = load_config()
     console.print(f"[yellow]Orchestrating[/] outline for: [bold]{query}[/]")
     if gaps:
         console.print(f"[yellow]Addressing gaps[/]: {', '.join(g[:50] for g in gaps)}")
 
-    raw = _llm_orchestrate(query, gaps_text)
-    _inc_llm(state)
+    raw = _llm_orchestrate(query)
+    toc = _parse_toc_json(raw, query)
 
-    # Strip code fences if the LLM wrapped the JSON anyway
-    raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+    topic_keywords = _extract_topic_keywords(query)
 
-    toc: dict = {}
-    try:
-        toc = json.loads(raw)
-    except json.JSONDecodeError:
-        console.print("[yellow]Orchestrator JSON parse failed — falling back to plan_node output[/]")
-
-    sub_questions = []
     existing = {
         sq.question: sq
         for sq in state.get("sub_questions", [])
         if isinstance(sq, SubQuestion) and sq.answered
     }
 
+    sub_questions = []
     for section in toc.get("sections", []):
         heading = section.get("heading", "").strip()
         if not heading:
             continue
+
+        # Fix generic headings by prepending query context
+        if heading.lower().strip() in _GENERIC_HEADINGS:
+            heading = f"{query.title()} — {heading}"
+
         raw_queries = section.get("search_queries", [])
         validated_queries = [
-            _unique_query(validate_and_clean_query(q, heading), used_queries)
+            _inject_topic(
+                _unique_query(validate_and_clean_query(q, heading), used_queries),
+                topic_keywords,
+            )
             for q in raw_queries
             if q.strip()
         ]
+
         if heading in existing:
             existing[heading].search_queries = validated_queries
             sub_questions.append(existing[heading])
         else:
             sub_questions.append(SubQuestion(question=heading, search_queries=validated_queries))
 
-    if not sub_questions:
-        # JSON was empty or unparseable — fall back to gap-based sub-questions
-        console.print("[yellow]Orchestrator returned no sections — using gaps as sub-questions[/]")
-        for gap in gaps or [query]:
-            sub_questions.append(SubQuestion(question=gap))
+    # Enforce section bounds
+    sub_questions = sub_questions[:cfg.max_sections]
+
+    if len(sub_questions) < cfg.min_sections:
+        console.print(
+            f"[yellow]Orchestrator returned only {len(sub_questions)} sections "
+            f"(min {cfg.min_sections}) — using gaps/query as extra sections[/]"
+        )
+        extras = [g for g in (gaps or [query]) if g not in [sq.question for sq in sub_questions]]
+        for extra in extras:
+            if len(sub_questions) >= cfg.max_sections:
+                break
+            sub_questions.append(SubQuestion(
+                question=extra,
+                search_queries=[_inject_topic(_extract_keywords(extra), topic_keywords)],
+            ))
 
     document_title = toc.get("title", "").strip() or query
 
+    console.print(f"[yellow]Sections:[/] {', '.join(sq.question[:40] for sq in sub_questions)}")
     return {
         "sub_questions": sub_questions,
         "document_title": document_title,
@@ -409,8 +458,10 @@ def search_node(state: dict) -> dict:
                         scraped_urls.add(url)
                 console.print(f"    {len(content):,} chars scraped")
                 all_results.append(SearchResult(title=title, url=url, snippet=item.get("snippet", ""), content=content))
+                # Adaptive delay: shorter when we got good content
                 if idx < len(diverse):
-                    time.sleep(cfg.search_delay_seconds)
+                    delay = cfg.search_delay_seconds * (0.5 if len(content) > 500 else 1.0)
+                    time.sleep(delay)
 
             if len(raw_results) > 1:
                 time.sleep(cfg.search_delay_seconds)
@@ -431,6 +482,7 @@ def summarize_node(state: dict) -> dict:
     """Map-reduce summarization: chunk-extract per source, then synthesize."""
     sub_questions = state.get("sub_questions", [])
     llm_calls = state.get("llm_call_count", 0)
+    topic_keywords = _extract_topic_keywords(state.get("query", ""))
 
     for sq in sub_questions:
         if not isinstance(sq, SubQuestion):
@@ -450,11 +502,22 @@ def summarize_node(state: dict) -> dict:
             console.print(f"  [red]No usable sources — marking unanswered[/]")
             continue
 
+        # Skip sections where all scraped content is off-topic
+        if topic_keywords and not _sources_are_on_topic(usable, topic_keywords):
+            console.print(
+                f"  [red]Sources off-topic (no '{', '.join(topic_keywords)}' found) — skipping[/]"
+            )
+            sq.answered = False
+            sq.search_queries = [
+                _inject_topic(q, topic_keywords) for q in (sq.search_queries or [])
+            ]
+            continue
+
         findings: list[str] = []
         for idx, result in enumerate(usable, start=1):
             console.print(f"  • Extracting [{idx}/{len(usable)}]: [bold]{result.title or 'Untitled'}[/]")
-            extracted = _extract_from_source(result, sq.question)
-            llm_calls += len(_chunk_content(result.content or ""))
+            extracted, calls = _extract_from_source(result, sq.question)
+            llm_calls += calls
             if extracted:
                 domain = urlparse(result.url).netloc.replace("www.", "")
                 findings.append(f"[{domain}]: {extracted}")
