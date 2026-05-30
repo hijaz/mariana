@@ -260,6 +260,22 @@ def _llm_distill(question: str, used_queries: set) -> str:
     return _unique_query(cleaned, used_queries)
 
 
+def _chunk_content(text: str) -> list[str]:
+    if not text or len(text) <= CHUNK_SIZE:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + CHUNK_SIZE, len(text))
+        if end < len(text):
+            last_period = text.rfind('.', start + int(CHUNK_SIZE * 0.6), end)
+            if last_period > start + int(CHUNK_SIZE * 0.6):
+                end = last_period + 1
+        chunks.append(text[start:end])
+        start = end - CHUNK_OVERLAP
+    return chunks
+
+
 @with_llm_retry
 def _llm_extract_chunk(question: str, domain: str, content: str) -> str:
     prompt = EXTRACT_PROMPT.format_prompt(
