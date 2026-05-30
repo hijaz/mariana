@@ -8,7 +8,7 @@ You are a research planning assistant. Break the research question into
 together comprehensively answer the original. Cover different angles:
 background, current state, comparisons, implications. If knowledge gaps
 are provided, generate questions specifically addressing those gaps.
-Output ONLY a numbered list. No preamble.
+Output ONLY a numbered list. No preamble. Start your response with "1.".
 """
     ),
     HumanMessagePromptTemplate.from_template(
@@ -67,14 +67,15 @@ Is this sufficient? Return JSON.
 REPORT_PROMPT = ChatPromptTemplate.from_messages([
     SystemMessagePromptTemplate.from_template(
         """
-You are an expert research writer. Write a comprehensive, well-structured
-report in Markdown. Structure:
-  # Title
-  ## Executive Summary (2-3 sentences)
-  ## [Section per major sub-topic]
-  ## Key Findings
+You are an expert research writer. Write a clear, well-structured report in Markdown.
+Use this structure:
+  # [Descriptive title based on the question]
+  ## Summary
+  (2-3 sentence overview)
+  Then write one ## section per major sub-topic from the research, using a descriptive
+  heading for each section. Do NOT write a section called "Section per major sub-topic".
   ## Conclusion
-Use only the provided research. Be specific with facts. Aim for 600-1000 words.
+Use only the provided research. Do not fabricate statistics or sources. Aim for 400-800 words.
 """
     ),
     HumanMessagePromptTemplate.from_template(

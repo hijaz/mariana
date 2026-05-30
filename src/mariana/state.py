@@ -27,6 +27,7 @@ class ResearchState(dict):
     gaps: list[str]
     final_report: str
     status: str
+    scraped_urls: set
     messages: Annotated[list[Any], add_messages]
 
 
@@ -38,5 +39,6 @@ def initial_state(query: str) -> dict:
         "gaps": [],
         "final_report": "",
         "status": "Starting...",
+        "scraped_urls": set(),
         "messages": [],
     }

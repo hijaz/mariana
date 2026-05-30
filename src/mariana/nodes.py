@@ -29,15 +29,27 @@ def _render_llm_output(result: Any) -> str:
 
 
 def _parse_numbered_list(text: str) -> list[str]:
+    """Extract only lines that begin with a digit prefix like '1.' or '2)'."""
     lines = text.strip().splitlines()
     items = []
     for line in lines:
-        match = re.match(r"^\s*(?:\d+[\.)]|-)?\s*(.+)$", line)
+        match = re.match(r"^\s*\d+[.)]\s+(.+)$", line)
         if match:
             item = match.group(1).strip()
             if item:
                 items.append(item)
     return items
+
+
+def _distill_search_query(question: str) -> str:
+    """Compress a verbose sub-question to a concise search query string."""
+    # strip markdown bold/italic markers
+    q = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", question)
+    # drop a leading "Label:" prefix (e.g. "Background & Fundamental Principles:")
+    q = re.sub(r"^[A-Za-z0-9 &,/()'\"\-]+:\s*", "", q)
+    # take only the first sentence / question clause
+    first = re.split(r"[?.!]", q)[0].strip()
+    return first[:100] if first else q[:100]
 
 
 def plan_node(state: dict) -> dict:
@@ -70,6 +82,7 @@ def plan_node(state: dict) -> dict:
 def search_node(state: dict) -> dict:
     cfg = load_config()
     sub_questions = state.get("sub_questions", [])
+    scraped_urls: set = set(state.get("scraped_urls") or set())
     console.print(f"[cyan]Searching[/] {len(sub_questions)} sub-question(s), max {cfg.max_results} results each")
     updated_questions = []
     for sq in sub_questions:
@@ -81,17 +94,25 @@ def search_node(state: dict) -> dict:
             updated_questions.append(sq)
             continue
 
-        console.print(f"[cyan]Searching question:[/] [bold]{sq.question}[/]")
-        raw_results = raw_search(sq.question, cfg.searxng_port, cfg.max_results)
+        search_query = _distill_search_query(sq.question)
+        console.print(f"[cyan]Searching question:[/] [bold]{sq.question[:80]}[/]")
+        console.print(f"  Query: [italic]{search_query}[/]")
+        raw_results = raw_search(search_query, cfg.searxng_port, cfg.max_results)
         if not raw_results:
-            console.print(f"[red]No search results found for:[/] {sq.question}")
+            console.print(f"[red]No search results found for:[/] {search_query}")
 
         results = []
         for idx, item in enumerate(raw_results, start=1):
             title = item.get("title", "[no title]")
             url = item.get("url", "")
             console.print(f"  • Result {idx}/{len(raw_results)}: [bold]{title}[/] ({url})")
-            content = raw_scrape(url, cfg.max_page_chars)
+            if url in scraped_urls:
+                console.print(f"    Already scraped — skipping duplicate URL")
+                content = ""
+            else:
+                content = raw_scrape(url, cfg.max_page_chars)
+                if content:
+                    scraped_urls.add(url)
             console.print(f"    Scraped {len(content)} chars from result {idx}")
             results.append(SearchResult(title=title, url=url, snippet=item.get("snippet", ""), content=content))
             if idx < len(raw_results):
@@ -105,7 +126,7 @@ def search_node(state: dict) -> dict:
         sq.results = results
         updated_questions.append(sq)
 
-    return {"sub_questions": updated_questions, "status": "Search complete"}
+    return {"sub_questions": updated_questions, "scraped_urls": scraped_urls, "status": "Search complete"}
 
 
 def summarize_node(state: dict) -> dict:
@@ -117,7 +138,12 @@ def summarize_node(state: dict) -> dict:
         if sq.answered or not sq.results:
             continue
 
-        console.print(f"[magenta]Summarizing[/] question: [bold]{sq.question}[/] using {len(sq.results)} source(s)")
+        total_chars = sum(len(r.content or "") for r in sq.results)
+        console.print(f"[magenta]Summarizing[/] question: [bold]{sq.question[:80]}[/] using {len(sq.results)} source(s) ({total_chars} chars)")
+        if total_chars < 300:
+            console.print(f"  [red]Insufficient content ({total_chars} chars) — marking unanswered for re-search[/]")
+            continue
+
         sources = []
         for idx, result in enumerate(sq.results, start=1):
             content = result.content or ""
@@ -163,6 +189,16 @@ def reflect_node(state: dict) -> dict:
             gaps = payload.get("gaps", []) or []
     except Exception:
         gaps = []
+
+    unanswered = [
+        sq.question for sq in sub_questions
+        if isinstance(sq, SubQuestion) and not sq.answered
+    ]
+    for q in unanswered:
+        if q not in gaps:
+            gaps.append(q)
+    if unanswered:
+        console.print(f"[blue]Unanswered sub-questions re-queued as gaps:[/] {len(unanswered)}")
 
     if gaps:
         console.print(f"[blue]Gaps identified:[/] {', '.join(gaps)}")

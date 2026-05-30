@@ -20,6 +20,11 @@ SKIP_DOMAINS = {
     "www.facebook.com",
     "tiktok.com",
     "www.tiktok.com",
+    # Paywalled — never return usable content
+    "researchgate.net",
+    "www.researchgate.net",
+    "sciencedirect.com",
+    "www.sciencedirect.com",
 }
 
 
@@ -54,6 +59,10 @@ def raw_scrape(url: str, max_chars: int = 4000) -> str:
     if any(host in url for host in SKIP_DOMAINS):
         return ""
 
+    # Skip PDFs — BeautifulSoup cannot parse binary content
+    if url.lower().split("?")[0].endswith(".pdf"):
+        return ""
+
     try:
         headers = {"User-Agent": "MarianaResearch/0.1 (local research agent)"}
         resp = httpx.get(url, headers=headers, timeout=12.0, follow_redirects=True)
@@ -64,7 +73,15 @@ def raw_scrape(url: str, max_chars: int = 4000) -> str:
             for el in soup.find_all(tag_name):
                 el.decompose()
 
-        target = soup.find("article") or soup.find("main") or soup.find(id="content") or soup.find(class_="content") or soup.body
+        target = (
+            soup.find("article")
+            or soup.find("main")
+            or soup.find(id="mw-content-text")   # Wikipedia
+            or soup.find(class_="mw-parser-output")  # Wikipedia fallback
+            or soup.find(id="content")
+            or soup.find(class_="content")
+            or soup.body
+        )
         if target is None:
             return ""
 
