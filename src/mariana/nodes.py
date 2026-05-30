@@ -13,7 +13,7 @@ from mariana.prompts import (
     DISTILL_PROMPT,
     EXEC_SUMMARY_PROMPT,
     EXTRACT_PROMPT,
-    ORCHESTRATOR_PROMPT,
+    QUERY_GENERATOR_PROMPT,
     PLANNER_PROMPT,
     REPORT_PROMPT,
     SECTION_PROMPT,
@@ -50,6 +50,7 @@ _STOP_WORDS = {
     "do", "does", "did", "have", "has", "had", "be", "been",
     "describe", "explain", "compare", "contrast", "detail",
     "specifically", "including", "particularly", "currently",
+    "work", "works", "tell", "give", "list", "about",
 }
 
 
@@ -88,6 +89,19 @@ def _extract_keywords(question: str) -> str:
     return " ".join(keywords[:6])
 
 
+_LEADING_STRIP = {'how', 'what', 'why', 'when', 'where', 'which', 'does', 'do', 'is', 'are', 'can', 'will'}
+_TRAILING_STRIP = {'how', 'work', 'works', 'do', 'does', 'like', 'mean', 'about'}
+
+
+def _strip_function_words(words: list[str]) -> list[str]:
+    """Remove leading/trailing function words that add no search value."""
+    while words and words[0].lower() in _LEADING_STRIP:
+        words = words[1:]
+    while words and words[-1].lower() in _TRAILING_STRIP:
+        words = words[:-1]
+    return words
+
+
 def validate_and_clean_query(raw: str, fallback_question: str) -> str:
     """Strip markdown artifacts from a distilled query; fall back to keyword extraction."""
     cleaned = raw.strip()
@@ -98,6 +112,7 @@ def validate_and_clean_query(raw: str, fallback_question: str) -> str:
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
     words = [w for w in cleaned.split() if len(w) > 1]
+    words = _strip_function_words(words)
 
     if len(words) == 0 or len(words) > 10:
         fallback = _extract_keywords(fallback_question)
@@ -188,6 +203,27 @@ def _sources_are_on_topic(sources: list, topic_keywords: list[str]) -> bool:
     return any(kw in combined for kw in topic_keywords)
 
 
+FALLBACK_ANGLES = [
+    "{kw0} {kw1} basic principles explained",
+    "{kw0} current technology research 2024",
+    "{kw0} {kw1} challenges limitations",
+    "{kw0} future applications progress",
+]
+
+
+def _deterministic_queries(query: str, n: int) -> list[str]:
+    """Generate n topic-specific search queries without any LLM call."""
+    keywords = _extract_topic_keywords(query)
+    kw0 = keywords[0] if keywords else query.split()[0].lower()
+    kw1 = keywords[1] if len(keywords) > 1 else ""
+    queries = []
+    for template in FALLBACK_ANGLES[:n]:
+        q = template.format(kw0=kw0, kw1=kw1).strip()
+        q = re.sub(r'\s+', ' ', q).strip()
+        queries.append(q)
+    return queries
+
+
 
 
 def _inc_llm(state: dict) -> None:
@@ -271,11 +307,12 @@ def _llm_section(question: str, summary: str) -> str:
 
 @with_llm_retry
 def _llm_conclusion(query: str, findings: str) -> str:
-    prompt = CONCLUSION_PROMPT.format_prompt(
-        query=truncate_for_llm(query, "query"),
-        findings=truncate_for_llm(findings, "findings"),
-    )
-    return _render_llm_output(get_summarizer_llm().generate_prompt([prompt])).strip()
+    chain = CONCLUSION_PROMPT | get_summarizer_llm()
+    result = chain.invoke({
+        "query": truncate_for_llm(query, "query"),
+        "findings": truncate_for_llm(findings, "findings"),
+    })
+    return (getattr(result, "content", None) or "").strip()
 
 
 @with_llm_retry
@@ -288,88 +325,84 @@ def _llm_exec_summary(query: str, summary_inputs: str) -> str:
 
 
 @with_llm_retry
-def _llm_orchestrate(query: str) -> str:
-    prompt = ORCHESTRATOR_PROMPT.format_prompt(
-        query=truncate_for_llm(query, "query"),
-    )
-    return _render_llm_output(get_planner_llm().generate_prompt([prompt])).strip()
+def _llm_generate_queries_raw(query: str, n: int) -> str:
+    """Ask the LLM for n search queries as a numbered list."""
+    chain = QUERY_GENERATOR_PROMPT | get_planner_llm()
+    result = chain.invoke({
+        "query": truncate_for_llm(query, "query"),
+        "n": n,
+    })
+    return (getattr(result, "content", None) or "").strip()
+
+
+def _llm_generate_queries(query: str, n: int) -> list[str]:
+    """Call LLM to generate n search queries; parse numbered list output."""
+    raw = _llm_generate_queries_raw(query, n)
+    return _parse_numbered_list(raw)
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
 
 def orchestrator_node(state: dict) -> dict:
-    """Generate a structured Table of Contents with pre-validated search queries."""
+    """Plan research by generating N targeted search queries as a numbered list."""
     query = state.get("query", "")
     gaps = state.get("gaps", []) or []
-    used_queries: set = set(state.get("used_queries") or set())
     cfg = load_config()
-    console.print(f"[yellow]Orchestrating[/] outline for: [bold]{query}[/]")
+    used_queries: set = set(state.get("used_queries") or set())
+    topic_keywords = _extract_topic_keywords(query)
+
+    console.print(f"[yellow]Planning[/] research for: [bold]{query}[/]")
     if gaps:
         console.print(f"[yellow]Addressing gaps[/]: {', '.join(g[:50] for g in gaps)}")
 
-    raw = _llm_orchestrate(query)
-    toc = _parse_toc_json(raw, query)
+    # Focus on gaps when present, otherwise research fresh
+    planner_query = (
+        f"{query} — specifically: {', '.join(gaps[:3])}" if gaps else query
+    )
 
-    topic_keywords = _extract_topic_keywords(query)
+    raw_queries = _llm_generate_queries(planner_query, cfg.max_sections)
 
+    # Validate every query and inject topic keywords as safety net
+    validated: list[str] = []
+    for q in raw_queries:
+        if not q.strip():
+            continue
+        clean = validate_and_clean_query(q, query)
+        validated.append(_inject_topic(clean, topic_keywords))
+    validated = [q for q in validated if q][:cfg.max_sections]
+
+    # Deterministic fallback — always produce min_sections good queries
+    if len(validated) < cfg.min_sections:
+        console.print(
+            f"[yellow]Planner returned {len(validated)} queries "
+            f"(min {cfg.min_sections}) — using deterministic fallback[/]"
+        )
+        validated = _deterministic_queries(query, cfg.max_sections)
+
+    # Build SubQuestion objects — query text doubles as heading and search query
     existing = {
         sq.question: sq
         for sq in state.get("sub_questions", [])
         if isinstance(sq, SubQuestion) and sq.answered
     }
-
-    sub_questions = []
-    for section in toc.get("sections", []):
-        heading = section.get("heading", "").strip()
-        if not heading:
-            continue
-
-        # Fix generic headings by prepending query context
-        if heading.lower().strip() in _GENERIC_HEADINGS:
-            heading = f"{query.title()} — {heading}"
-
-        raw_queries = section.get("search_queries", [])
-        validated_queries = [
-            _inject_topic(
-                _unique_query(validate_and_clean_query(q, heading), used_queries),
-                topic_keywords,
-            )
-            for q in raw_queries
-            if q.strip()
-        ]
-
+    sub_questions: list[SubQuestion] = []
+    for q in validated:
+        heading = q.title()
+        deduped = _unique_query(q, used_queries)
         if heading in existing:
-            existing[heading].search_queries = validated_queries
+            existing[heading].search_queries = [deduped]
             sub_questions.append(existing[heading])
         else:
-            sub_questions.append(SubQuestion(question=heading, search_queries=validated_queries))
+            sub_questions.append(SubQuestion(question=heading, search_queries=[deduped]))
 
-    # Enforce section bounds
-    sub_questions = sub_questions[:cfg.max_sections]
-
-    if len(sub_questions) < cfg.min_sections:
-        console.print(
-            f"[yellow]Orchestrator returned only {len(sub_questions)} sections "
-            f"(min {cfg.min_sections}) — using gaps/query as extra sections[/]"
-        )
-        extras = [g for g in (gaps or [query]) if g not in [sq.question for sq in sub_questions]]
-        for extra in extras:
-            if len(sub_questions) >= cfg.max_sections:
-                break
-            sub_questions.append(SubQuestion(
-                question=extra,
-                search_queries=[_inject_topic(_extract_keywords(extra), topic_keywords)],
-            ))
-
-    document_title = toc.get("title", "").strip() or query
-
+    document_title = query.title()
     console.print(f"[yellow]Sections:[/] {', '.join(sq.question[:40] for sq in sub_questions)}")
     return {
         "sub_questions": sub_questions,
         "document_title": document_title,
         "used_queries": used_queries,
         "llm_call_count": state.get("llm_call_count", 0) + 1,
-        "status": f"Outline: {len(sub_questions)} sections planned",
+        "status": f"Planned {len(sub_questions)} sections",
     }
 
 
@@ -651,346 +684,4 @@ def report_node(state: dict) -> dict:
         "llm_call_count": llm_calls,
         "status": f"Report saved to {filepath}",
     }
-
-
-console = Console()
-
-# Phrases that indicate a vague, unhelpful summary — used in reflect heuristic
-_VAGUE_PHRASES = [
-    "in general",
-    "it depends",
-    "various factors",
-    "many aspects",
-    "further research",
-    "not enough information",
-    "unclear",
-    "it is difficult",
-]
-
-
-def _render_llm_output(result: Any) -> str:
-    try:
-        generation = result.generations[0][0]
-    except Exception:
-        return ""
-    if hasattr(generation, "message"):
-        content = getattr(generation.message, "content", "") or ""
-        if content:
-            return content
-    return getattr(generation, "text", "") or ""
-
-
-def _parse_numbered_list(text: str) -> list[str]:
-    """Extract only lines that begin with a digit prefix like '1.' or '2)'."""
-    lines = text.strip().splitlines()
-    items = []
-    for line in lines:
-        match = re.match(r"^\s*\d+[.)]\s+(.+)$", line)
-        if match:
-            item = match.group(1).strip()
-            if item:
-                items.append(item)
-    return items
-
-
-def _clean_heading(question: str) -> str:
-    """Strip markdown bold/italic markers and trim for use as a section heading."""
-    return re.sub(r"\*{1,3}([^*]*)\*{1,3}", r"\1", question).strip()
-
-
-# ── LLM call helpers (wrapped with retry) ────────────────────────────────────
-
-@with_llm_retry
-def _llm_plan(query: str, gaps: str, num_questions: int) -> str:
-    prompt = PLANNER_PROMPT.format_prompt(
-        query=truncate_for_llm(query, "query"),
-        gaps=truncate_for_llm(gaps, "gaps"),
-        num_questions=num_questions,
-    )
-    return _render_llm_output(get_planner_llm().generate_prompt([prompt])).strip()
-
-
-@with_llm_retry
-def _llm_distill(question: str) -> str:
-    prompt = DISTILL_PROMPT.format_prompt(question=truncate_for_llm(question, "question"))
-    raw = _render_llm_output(get_planner_llm().generate_prompt([prompt])).strip()
-    # Trim to ≤100 chars and remove surrounding quotes the LLM might add
-    raw = raw.strip('"\'').split("\n")[0].strip()
-    return raw[:100] if raw else question[:80]
-
-
-@with_llm_retry
-def _llm_extract(question: str, title: str, url: str, content: str) -> str:
-    prompt = EXTRACT_PROMPT.format_prompt(
-        question=truncate_for_llm(question, "question"),
-        source_title=title,
-        source_url=url,
-        content=truncate_for_llm(content, f"source:{url}"),
-    )
-    return _render_llm_output(get_summarizer_llm().generate_prompt([prompt])).strip()
-
-
-@with_llm_retry
-def _llm_synthesize(question: str, findings: str) -> str:
-    prompt = SYNTHESIZE_PROMPT.format_prompt(
-        question=truncate_for_llm(question, "question"),
-        findings=truncate_for_llm(findings, "findings"),
-    )
-    return _render_llm_output(get_summarizer_llm().generate_prompt([prompt])).strip()
-
-
-@with_llm_retry
-def _llm_section(question: str, summary: str) -> str:
-    prompt = SECTION_PROMPT.format_prompt(
-        question=truncate_for_llm(question, "question"),
-        summary=truncate_for_llm(summary, "summary"),
-    )
-    return _render_llm_output(get_summarizer_llm().generate_prompt([prompt])).strip()
-
-
-@with_llm_retry
-def _llm_exec_summary(query: str, section_texts: str) -> str:
-    prompt = EXEC_SUMMARY_PROMPT.format_prompt(
-        query=truncate_for_llm(query, "query"),
-        section_texts=truncate_for_llm(section_texts, "sections"),
-    )
-    return _render_llm_output(get_summarizer_llm().generate_prompt([prompt])).strip()
-
-
-# ── Nodes ─────────────────────────────────────────────────────────────────────
-
-def plan_node(state: dict) -> dict:
-    query = state.get("query", "")
-    gaps = state.get("gaps", []) or []
-    gaps_text = "\n".join(f"- {gap}" for gap in gaps) if gaps else "None yet"
-    cfg = load_config()
-    console.print(f"[yellow]Planning[/] query: [bold]{query}[/]")
-    if gaps:
-        console.print(f"[yellow]Existing gaps[/]: {', '.join(gaps)}")
-
-    answer = _llm_plan(query, gaps_text, cfg.num_subquestions)
-    questions = _parse_numbered_list(answer)
-
-    existing = {
-        sq.question: sq
-        for sq in state.get("sub_questions", [])
-        if isinstance(sq, SubQuestion) and sq.answered
-    }
-    new_sub_questions = []
-    for question in questions:
-        if question in existing:
-            new_sub_questions.append(existing[question])
-        else:
-            new_sub_questions.append(SubQuestion(question=question))
-
-    return {
-        "sub_questions": new_sub_questions,
-        "status": f"Planned {len(new_sub_questions)} sub-questions",
-    }
-
-
-def search_node(state: dict) -> dict:
-    cfg = load_config()
-    sub_questions = state.get("sub_questions", [])
-    scraped_urls: set = set(state.get("scraped_urls") or set())
-    console.print(f"[cyan]Searching[/] {len(sub_questions)} sub-question(s), max {cfg.max_results} results each")
-    updated_questions = []
-    for sq in sub_questions:
-        if not isinstance(sq, SubQuestion):
-            updated_questions.append(sq)
-            continue
-
-        if sq.answered:
-            updated_questions.append(sq)
-            continue
-
-        # LLM-based query distillation
-        search_query = _llm_distill(sq.question)
-        console.print(f"[cyan]Searching question:[/] [bold]{sq.question[:80]}[/]")
-        console.print(f"  Query: [italic]{search_query}[/]")
-        raw_results = raw_search(search_query, cfg.searxng_port, cfg.max_results)
-        if not raw_results:
-            console.print(f"[red]No search results found for:[/] {search_query}")
-
-        results = []
-        for idx, item in enumerate(raw_results, start=1):
-            title = item.get("title", "[no title]")
-            url = item.get("url", "")
-            console.print(f"  • Result {idx}/{len(raw_results)}: [bold]{title}[/] ({url})")
-            if url in scraped_urls:
-                console.print(f"    Already scraped — skipping duplicate URL")
-                content = ""
-            else:
-                content = raw_scrape(url, cfg.max_page_chars)
-                if content:
-                    scraped_urls.add(url)
-            console.print(f"    Scraped {len(content)} chars from result {idx}")
-            results.append(SearchResult(title=title, url=url, snippet=item.get("snippet", ""), content=content))
-            if idx < len(raw_results):
-                console.print(f"    Waiting {cfg.search_delay_seconds:.1f}s before next result to reduce blocking risk")
-                time.sleep(cfg.search_delay_seconds)
-
-        if len(raw_results) > 1:
-            console.print(f"  Waiting {cfg.search_delay_seconds:.1f}s before next search question")
-            time.sleep(cfg.search_delay_seconds)
-
-        sq.results = results
-        updated_questions.append(sq)
-
-    return {"sub_questions": updated_questions, "scraped_urls": scraped_urls, "status": "Search complete"}
-
-
-def summarize_node(state: dict) -> dict:
-    """Map-reduce summarization: extract per source, then synthesize."""
-    sub_questions = state.get("sub_questions", [])
-    for sq in sub_questions:
-        if not isinstance(sq, SubQuestion):
-            continue
-        if sq.answered or not sq.results:
-            continue
-
-        # Filter to sources with enough content
-        usable = [r for r in sq.results if len(r.content or "") > 200]
-        sq.total_scraped_chars = sum(len(r.content or "") for r in usable)
-
-        total_chars = sum(len(r.content or "") for r in sq.results)
-        console.print(
-            f"[magenta]Summarizing[/] question: [bold]{sq.question[:80]}[/] "
-            f"— {len(usable)}/{len(sq.results)} usable sources ({sq.total_scraped_chars} chars)"
-        )
-
-        if len(usable) == 0:
-            console.print(f"  [red]No usable sources (all < 200 chars) — marking unanswered for re-search[/]")
-            continue
-
-        # Map: extract relevant facts from each source
-        findings: list[str] = []
-        for idx, result in enumerate(usable, start=1):
-            console.print(f"  • Extracting from source {idx}/{len(usable)}: [bold]{result.title or 'Untitled'}[/]")
-            extracted = _llm_extract(sq.question, result.title or "Untitled", result.url, result.content or "")
-            if extracted and extracted.lower().strip() != "not relevant.":
-                findings.append(f"[{result.title or result.url}]: {extracted}")
-
-        if not findings:
-            console.print(f"  [red]All sources marked not relevant — marking unanswered[/]")
-            continue
-
-        # Reduce: synthesize findings into a single answer
-        findings_text = "\n\n".join(findings)
-        sq.summary = _llm_synthesize(sq.question, findings_text)
-        sq.answered = True
-        console.print(f"  ✓ Summarized: {len(sq.summary)} chars")
-
-    # Write in-progress partial report after each summarize pass
-    partial_path = write_partial_report(state)
-    console.print(f"[dim]Partial report updated: {partial_path}[/]")
-
-    return {"sub_questions": sub_questions, "status": "Summarization complete"}
-
-
-def reflect_node(state: dict) -> dict:
-    """Deterministic quality check — no LLM call."""
-    cfg = load_config()
-    iteration = state.get("iteration", 0) + 1
-    console.print(f"[blue]Reflecting[/] iteration {iteration}/{cfg.max_iterations}")
-
-    if iteration >= cfg.max_iterations:
-        console.print("[blue]Max iterations reached.[/] Moving to report.")
-        return {"iteration": iteration, "gaps": [], "status": f"Iteration {iteration} complete"}
-
-    sub_questions = state.get("sub_questions", [])
-    gaps: list[str] = []
-
-    # Always re-queue unanswered sub-questions
-    unanswered = [sq.question for sq in sub_questions if isinstance(sq, SubQuestion) and not sq.answered]
-    gaps.extend(unanswered)
-    if unanswered:
-        console.print(f"[blue]Unanswered sub-questions re-queued:[/] {len(unanswered)}")
-
-    # Check answered questions for quality issues
-    for sq in sub_questions:
-        if not isinstance(sq, SubQuestion) or not sq.answered:
-            continue
-
-        # 1. Insufficient content
-        if sq.total_scraped_chars < 500:
-            console.print(f"  [yellow]Low content ({sq.total_scraped_chars} chars) for:[/] {sq.question[:60]}")
-            if sq.question not in gaps:
-                gaps.append(sq.question)
-            continue
-
-        # 2. Summary too short
-        if len(sq.summary or "") < 50:
-            console.print(f"  [yellow]Summary too short ({len(sq.summary)} chars) for:[/] {sq.question[:60]}")
-            if sq.question not in gaps:
-                gaps.append(sq.question)
-            continue
-
-        # 3. Too many vague phrases
-        summary_lower = (sq.summary or "").lower()
-        vague_count = sum(1 for phrase in _VAGUE_PHRASES if phrase in summary_lower)
-        if vague_count > 4:
-            console.print(f"  [yellow]Vague summary ({vague_count} vague phrases) for:[/] {sq.question[:60]}")
-            if sq.question not in gaps:
-                gaps.append(sq.question)
-
-    # Enforce minimum 2 iterations
-    if iteration < 2 and not gaps:
-        console.print("[blue]Minimum 2 iterations not yet reached — continuing.[/]")
-        # Re-queue all unanswered questions; if all answered, add a refinement pass marker
-        unanswered_now = [sq.question for sq in sub_questions if isinstance(sq, SubQuestion) and not sq.answered]
-        if unanswered_now:
-            gaps = unanswered_now
-
-    if gaps:
-        console.print(f"[blue]Gaps identified:[/] {', '.join(g[:40] for g in gaps)}")
-    else:
-        console.print("[blue]No gaps identified.[/] Ready to generate report.")
-
-    return {"iteration": iteration, "gaps": gaps, "status": f"Iteration {iteration} complete"}
-
-
-def report_node(state: dict) -> dict:
-    """Generate a per-section report using SECTION_PROMPT + EXEC_SUMMARY_PROMPT."""
-    cfg = load_config()
-    query = state.get("query", "")
-    answered = [sq for sq in state.get("sub_questions", []) if isinstance(sq, SubQuestion) and sq.answered]
-    console.print(f"[green]Generating report[/] from {len(answered)} answered question(s)")
-
-    # Generate each section independently
-    sections: list[tuple[str, str]] = []  # (heading, body)
-    for sq in answered:
-        heading = _clean_heading(sq.question)
-        console.print(f"  • Writing section: [bold]{heading[:60]}[/]")
-        body = _llm_section(sq.question, sq.summary)
-        sections.append((heading, body))
-
-    # Build section texts for executive summary
-    section_texts = "\n\n".join(f"## {h}\n{b}" for h, b in sections)
-
-    # Generate executive summary from section text
-    exec_summary = _llm_exec_summary(query, section_texts)
-
-    # Assemble report
-    lines = [f"# Research Report: {query}\n"]
-    lines.append("## Summary\n")
-    lines.append(exec_summary)
-    lines.append("")
-    for heading, body in sections:
-        lines.append(f"\n## {heading}\n")
-        lines.append(body)
-        lines.append("")
-    lines.append("\n## Conclusion\n")
-    lines.append(f"This report covered {len(answered)} sub-questions about: {query}")
-    report = "\n".join(lines)
-
-    output_dir = ensure_output_dir(cfg)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    sanitized = re.sub(r"[^a-z0-9]+", "_", query.lower())[:40].strip("_")
-    filename = f"{timestamp}_{sanitized or 'report'}.md"
-    filepath = output_dir / filename
-    filepath.write_text(report, encoding="utf-8")
-
-    console.print(f"[green]Report written to[/] {filepath}")
-    return {"final_report": report, "status": f"Report saved to {filepath}"}
 
