@@ -1,7 +1,9 @@
 import atexit
+import hashlib
 import re
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import click
 from rich.console import Console
@@ -10,10 +12,19 @@ from rich.panel import Panel
 from rich.table import Table
 
 from mariana.graph import get_graph
-from mariana.state import initial_state
+from mariana.state import SubQuestion, initial_state
 from mariana.utils.config import load_config, save_setting
 from mariana.utils.llm import check_ollama, get_planner_llm, get_summarizer_llm
 from mariana.utils.searxng import SearXNGManager
+from mariana.utils.tracing import write_trace
+
+NODE_LABELS = {
+    "plan":      "Orchestrating outline",
+    "search":    "Searching & scraping",
+    "summarize": "Summarizing sources",
+    "reflect":   "Reflecting on coverage",
+    "report":    "Writing report",
+}
 
 console = Console()
 
@@ -65,23 +76,88 @@ def _preflight(model=None, iterations=None):
     return cfg, manager
 
 
-def _run_query(query: str, cfg):
+def _query_thread_id(query: str) -> str:
+    """Stable thread ID derived from the query for LangGraph checkpointing."""
+    return hashlib.md5(query.strip().lower().encode()).hexdigest()[:16]
+
+
+def _print_session_summary(state: dict, elapsed: float, report_path: Path | None = None) -> None:
+    sub_questions = state.get("sub_questions", [])
+    answered = [sq for sq in sub_questions if isinstance(sq, SubQuestion) and sq.answered]
+    total_sources = sum(len(sq.results) for sq in sub_questions if isinstance(sq, SubQuestion))
+    usable_sources = sum(
+        len([r for r in sq.results if len(r.content or "") > 200])
+        for sq in sub_questions if isinstance(sq, SubQuestion)
+    )
+    domains = {
+        urlparse(r.url).netloc.replace("www.", "")
+        for sq in sub_questions if isinstance(sq, SubQuestion)
+        for r in sq.results
+    }
+    llm_calls = state.get("llm_call_count", 0)
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_row("Sections completed", f"{len(answered)} / {len(sub_questions)}")
+    table.add_row("Sources scraped", f"{total_sources} ({usable_sources} usable)")
+    table.add_row("Unique domains", str(len(domains)))
+    table.add_row("LLM calls", str(llm_calls))
+    table.add_row("Total time", f"{elapsed:.0f}s")
+    if report_path:
+        table.add_row("Report", str(report_path))
+    console.print(Panel(table, title="Session Summary", border_style="dim"))
+
+
+def _run_query(query: str, cfg, fresh: bool = False):
     console.print(Panel(f"[blue]Research started:[/] {query}", title="Mariana"))
-    console.print(f"[white]Expected iterations:[/] {cfg.max_iterations}")
-    console.print(f"[white]Search results per question:[/] {cfg.max_results}")
-    console.print(f"[white]Delay between fetches:[/] {cfg.search_delay_seconds:.1f}s")
+    console.print(f"[white]Iterations:[/] {cfg.max_iterations}  "
+                  f"[white]Results/question:[/] {cfg.max_results}  "
+                  f"[white]Delay:[/] {cfg.search_delay_seconds:.1f}s")
     start = time.time()
 
+    thread_id = _query_thread_id(query)
+    run_config = {"configurable": {"thread_id": thread_id}}
+    if fresh:
+        console.print(f"[dim]--fresh: new thread {thread_id}[/]")
+        run_config["configurable"]["thread_id"] = thread_id + "_" + str(int(time.time()))
+
     graph = get_graph()
-    output = graph.invoke(initial_state(query))
+    final_state: dict = {}
+
+    try:
+        for event in graph.stream(initial_state(query), config=run_config, stream_mode="updates"):
+            for node_name, node_output in event.items():
+                label = NODE_LABELS.get(node_name, node_name)
+                node_status = node_output.get("status", "")
+                elapsed_so_far = time.time() - start
+                console.print(
+                    f"  [dim]{elapsed_so_far:5.1f}s[/]  [bold cyan]{label}[/]  {node_status}"
+                )
+                final_state.update(node_output)
+    except TypeError:
+        # Checkpointer not available — fall back to invoke without config
+        final_state = graph.invoke(initial_state(query))
 
     elapsed = time.time() - start
-    report = output.get("final_report", "")
+    report = final_state.get("final_report", "")
     if not report:
         console.print(Panel("[red]No report was generated.", title="Error"))
         raise SystemExit(1)
 
-    console.print(Panel(f"[green]Research complete in {elapsed:.1f} seconds.[/]", title="Done"))
+    # Extract report path from status message
+    status_msg = final_state.get("status", "")
+    report_path: Path | None = None
+    path_match = re.search(r"Report saved to (.+)", status_msg)
+    if path_match:
+        report_path = Path(path_match.group(1).strip())
+
+    # Write trace file
+    try:
+        trace_path = write_trace(final_state, elapsed, report_path)
+        console.print(f"[dim]Trace → {trace_path}[/]")
+    except Exception:
+        pass
+
+    _print_session_summary(final_state, elapsed, report_path)
     console.print(Markdown(report))
 
 
@@ -95,10 +171,11 @@ def cli():
 @click.argument("query")
 @click.option("--model", default=None, help="Override Ollama model")
 @click.option("--iterations", default=None, type=int, help="Max research iterations")
-def research(query, model, iterations):
+@click.option("--fresh", is_flag=True, default=False, help="Ignore saved checkpoint and start fresh")
+def research(query, model, iterations, fresh):
     "Run deep research on a question and save a Markdown report."
     cfg, _ = _preflight(model=model, iterations=iterations)
-    _run_query(query, cfg)
+    _run_query(query, cfg, fresh=fresh)
 
 
 @cli.command()
@@ -156,3 +233,32 @@ def reports():
     for path in files:
         table.add_row(path.name, str(path.stat().st_mtime))
     console.print(table)
+
+
+@cli.command()
+def status():
+    "Show Ollama and SearXNG status without starting a research run."
+    cfg = load_config()
+    table = Table(title="Mariana Status", show_header=False, box=None, padding=(0, 2))
+
+    ollama_ok, result = check_ollama()
+    table.add_row("Ollama", f"[green]OK[/] {cfg.ollama_base_url}" if ollama_ok else f"[red]FAIL[/] {result}")
+    if isinstance(result, list):
+        table.add_row("Models", ", ".join(result[:8]))
+    table.add_row("Planner model", cfg.planner_model)
+    table.add_row("Summarizer model", cfg.summarizer_model)
+
+    from mariana.utils.searxng import SearXNGManager as _M
+    mgr = _M()
+    searxng_ok = mgr._is_responsive(cfg.searxng_port)
+    table.add_row("SearXNG", f"[green]running[/] port {cfg.searxng_port}" if searxng_ok else "[yellow]not running[/]")
+
+    output_dir = Path(cfg.output_dir)
+    reports_count = len(list(output_dir.glob("*.md"))) if output_dir.exists() else 0
+    traces_count = len(list(output_dir.glob("*_trace.json"))) if output_dir.exists() else 0
+    table.add_row("Reports saved", str(reports_count))
+    table.add_row("Trace files", str(traces_count))
+    table.add_row("Output dir", str(output_dir))
+
+    console.print(Panel(table, border_style="blue"))
+

@@ -18,6 +18,8 @@ class SubQuestion:
     results: list[SearchResult] = field(default_factory=list)
     summary: str = ""
     answered: bool = False
+    total_scraped_chars: int = 0
+    search_queries: list[str] = field(default_factory=list)
 
 
 class ResearchState(dict):
@@ -29,6 +31,10 @@ class ResearchState(dict):
     status: str
     scraped_urls: set
     messages: Annotated[list[Any], add_messages]
+    document_title: str
+    used_queries: set
+    session_domain_counts: dict
+    llm_call_count: int
 
 
 def initial_state(query: str) -> dict:
@@ -41,4 +47,8 @@ def initial_state(query: str) -> dict:
         "status": "Starting...",
         "scraped_urls": set(),
         "messages": [],
+        "document_title": "",
+        "used_queries": set(),
+        "session_domain_counts": {},
+        "llm_call_count": 0,
     }

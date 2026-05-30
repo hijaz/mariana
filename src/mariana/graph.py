@@ -1,7 +1,12 @@
+from pathlib import Path
+
+from langgraph.graph import END, START, StateGraph
+
+from mariana.nodes import orchestrator_node, reflect_node, report_node, search_node, summarize_node
 from mariana.state import ResearchState
-from mariana.nodes import plan_node, search_node, summarize_node, reflect_node, report_node
 from mariana.utils.config import load_config
-from langgraph.graph import StateGraph, START, END
+
+_CHECKPOINT_DIR = Path.home() / ".mariana" / "checkpoints"
 
 
 def route_after_reflect(state: dict) -> str:
@@ -13,9 +18,9 @@ def route_after_reflect(state: dict) -> str:
     return "report"
 
 
-def build_graph():
+def build_graph(checkpointer=None):
     builder = StateGraph(ResearchState)
-    builder.add_node("plan", plan_node)
+    builder.add_node("plan", orchestrator_node)
     builder.add_node("search", search_node)
     builder.add_node("summarize", summarize_node)
     builder.add_node("reflect", reflect_node)
@@ -30,14 +35,22 @@ def build_graph():
         route_after_reflect,
         {"plan": "plan", "report": "report"},
     )
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
-_graph = None
+def get_graph(use_checkpointing: bool = True):
+    """Return a compiled graph, optionally with SQLite checkpointing."""
+    if not use_checkpointing:
+        return build_graph()
 
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
 
-def get_graph():
-    global _graph
-    if _graph is None:
-        _graph = build_graph()
-    return _graph
+        _CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        db_path = str(_CHECKPOINT_DIR / "mariana.db")
+        checkpointer = SqliteSaver.from_conn_string(db_path)
+        return build_graph(checkpointer=checkpointer)
+    except Exception:
+        # Fall back to no checkpointing if sqlite saver unavailable
+        return build_graph()
+

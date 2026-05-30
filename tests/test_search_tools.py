@@ -36,10 +36,18 @@ def test_raw_search_returns_empty_when_searxng_returns_500(monkeypatch):
 
 
 def test_raw_scrape_example_returns_text(monkeypatch):
-    def fake_get(url, headers=None, timeout=None, follow_redirects=None):
-        return DummyResponse(status_code=200, text="<html><body><article><p>Hello world</p></article></body></html>")
+    long_text = "Hello world. " * 20  # >200 chars so readability tier accepts it
+    html = f"<html><body><article><p>{long_text}</p></article></body></html>"
 
+    def fake_get(url, headers=None, timeout=None, follow_redirects=None):
+        return DummyResponse(status_code=200, text=html)
+
+    # trafilatura.fetch_url is tried first; return None to fall through to readability tier
+    monkeypatch.setattr("mariana.tools.search.trafilatura.fetch_url", lambda url: None)
     monkeypatch.setattr("mariana.tools.search.httpx.get", fake_get)
+    # Bypass scrape cache
+    monkeypatch.setattr("mariana.tools.search._cache_get", lambda url: None)
+    monkeypatch.setattr("mariana.tools.search._cache_set", lambda url, content: None)
     result = raw_scrape("https://example.com", max_chars=4000)
     assert "Hello world" in result
 

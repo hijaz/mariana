@@ -19,13 +19,45 @@ Known gaps to address: {gaps}
     ),
 ])
 
-SUMMARIZER_PROMPT = ChatPromptTemplate.from_messages([
+DISTILL_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Convert the research question into a short web search query.\n"
+     "RULES:\n"
+     "- Output ONLY the raw query text. Nothing else.\n"
+     "- 3 to 7 words maximum\n"
+     "- No markdown. No backticks. No quotes. No punctuation.\n"
+     "- No explanation. No preamble. No code blocks.\n"
+     "- Do not use question marks\n"
+     "- Example good output: nuclear fusion plasma confinement tokamak"),
+    ("human", "Research question: {question}"),
+])
+
+EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
     SystemMessagePromptTemplate.from_template(
         """
-You are a research analyst. Extract and summarize only the information
-relevant to the given question from the provided sources. Be factual and
-concise (3-5 sentences). Cite sources inline as [Source: domain.com].
-If the content doesn't address the question, say "Not relevant."
+You are a research analyst. Extract only the key facts from the source
+that are directly relevant to the question. Be concise (2-4 sentences).
+If the source has no relevant information, output exactly: "Not relevant."
+Do not fabricate anything.
+"""
+    ),
+    HumanMessagePromptTemplate.from_template(
+        """
+Question: {question}
+
+Source ({source_title}, {source_url}):
+{content}
+
+Key facts relevant to the question:"""
+    ),
+])
+
+SYNTHESIZE_PROMPT = ChatPromptTemplate.from_messages([
+    SystemMessagePromptTemplate.from_template(
+        """
+You are a research synthesizer. Combine the extracted findings below into
+a single coherent paragraph that directly answers the question.
+Be factual, concise, and cite sources as [source_title].
 Do not fabricate information.
 """
     ),
@@ -33,35 +65,73 @@ Do not fabricate information.
         """
 Question: {question}
 
-Sources:
-{sources}
+Extracted findings:
+{findings}
 
-Provide a focused summary answering the question above.
-"""
+Synthesized answer:"""
     ),
 ])
 
-REFLECT_PROMPT = ChatPromptTemplate.from_messages([
+SECTION_PROMPT = ChatPromptTemplate.from_messages([
     SystemMessagePromptTemplate.from_template(
         """
-You are a research quality reviewer. Evaluate whether the gathered research
-is sufficient to write a comprehensive answer to the original question.
-Return ONLY valid JSON with exactly these fields:
-  {{"sufficient": true/false, "gaps": ["gap1", "gap2"], "reasoning": "..."}}
-Mark sufficient=true only when the question is well-answered with specific
-facts, not vague generalities.
+You are a technical writer. Write one focused Markdown section (150-250 words)
+that answers the research question below. Use only the provided summary.
+Output only the section body text — no heading, no title.
 """
     ),
     HumanMessagePromptTemplate.from_template(
         """
-Original question: {query}
+Question: {question}
 
-Research gathered:
-{summaries}
+Summary:
+{summary}
 
-Is this sufficient? Return JSON.
+Section:"""
+    ),
+])
+
+EXEC_SUMMARY_PROMPT = ChatPromptTemplate.from_messages([
+    SystemMessagePromptTemplate.from_template(
+        """
+You are a research writer. Write a 2-3 sentence executive summary for a
+research report. The summary must cover the most important findings only.
+Output only the summary text.
 """
     ),
+    HumanMessagePromptTemplate.from_template(
+        """
+Research question: {query}
+
+Key findings from sections:
+{section_texts}
+
+Executive summary:"""
+    ),
+])
+
+CONCLUSION_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Write a 2-3 sentence conclusion for a research report. "
+     "Synthesize the key takeaways. Be specific. "
+     "Do not use phrases like 'further research is needed' or "
+     "'this report has shown'. Get straight to the insight."),
+    ("human", "Topic: {query}\n\nFindings summary:\n{findings}"),
+])
+
+ORCHESTRATOR_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a research architect. Generate a structured table of contents for a "
+     "research report.\n"
+     "Output ONLY valid JSON matching this schema exactly:\n"
+     '{{"title": "...", "sections": [{{"heading": "...", "search_queries": ["query1", "query2"]}}]}}\n'
+     "RULES:\n"
+     "- 3-5 sections, each with 2 search queries\n"
+     "- Headings must be short noun phrases (3-6 words), not questions\n"
+     "- Search queries must be 3-7 plain words with no punctuation or markdown\n"
+     "- No backticks, no code fences, no extra keys\n"
+     "- Output raw JSON only"),
+    ("human", "Research topic: {query}\n\nKnown gaps to address: {gaps}"),
 ])
 
 REPORT_PROMPT = ChatPromptTemplate.from_messages([
@@ -89,3 +159,4 @@ Write the full report now.
 """
     ),
 ])
+

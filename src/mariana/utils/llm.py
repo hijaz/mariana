@@ -3,8 +3,12 @@ from typing import Any
 
 import httpx
 from langchain_ollama import ChatOllama
+from rich.console import Console
 
 from mariana.utils.config import load_config
+
+MAX_LLM_INPUT_CHARS = 2000
+console = Console()
 
 
 @lru_cache(maxsize=1)
@@ -27,6 +31,17 @@ def get_summarizer_llm() -> ChatOllama:
         temperature=0.1,
         num_predict=2048,
     )
+
+
+def truncate_for_llm(text: str, label: str = "input") -> str:
+    """Truncate text to MAX_LLM_INPUT_CHARS and warn if truncated."""
+    if len(text) <= MAX_LLM_INPUT_CHARS:
+        return text
+    console.print(
+        f"  [dim][LLM] truncating {label} from {len(text)} → {MAX_LLM_INPUT_CHARS} chars[/]"
+    )
+    return text[:MAX_LLM_INPUT_CHARS]
+
 
 
 def check_ollama() -> tuple[bool, list[str] | str]:

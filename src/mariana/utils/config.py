@@ -33,7 +33,7 @@ class MarianaConfig(BaseSettings):
     max_results: int = 5
     num_subquestions: int = 3
     max_iterations: int = 3
-    max_page_chars: int = 4000
+    max_page_chars: int = 20000
     search_delay_seconds: float = 2.0
     output_dir: Path = RUNTIME_DIR / "output"
 

@@ -43,6 +43,10 @@ engines:
     engine: arxiv
     shortcut: ar
     disabled: false
+  - name: brave
+    engine: brave
+    shortcut: br
+    disabled: false
 """
 
 
