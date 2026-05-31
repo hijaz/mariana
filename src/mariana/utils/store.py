@@ -254,6 +254,18 @@ def pending_count(doc_id: str) -> int:
 
 # ── ToC rendering ─────────────────────────────────────────────────────────────
 
+def get_pending_sections(doc_id: str) -> list[dict]:
+    """Return toc_nodes that are still pending or interrupted (active)."""
+    with get_db() as db:
+        rows = db.execute(
+            """SELECT * FROM toc_nodes
+               WHERE document_id=? AND status IN ('pending', 'active')
+               ORDER BY order_index""",
+            (doc_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def build_collapsed_toc(doc_id: str, current_node_id: str | None = None) -> str:
     nodes = get_toc(doc_id)
     STATUS_ICON = {

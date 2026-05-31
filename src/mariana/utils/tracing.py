@@ -5,7 +5,6 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-from mariana.state import SubQuestion
 from mariana.utils.config import ensure_output_dir, load_config
 
 
@@ -21,17 +20,17 @@ def write_trace(state: dict, elapsed: float, report_path: Path | None = None) ->
     slug = _sanitize(state.get("query", ""))
     trace_path = output_dir / f"{timestamp}_{slug}_trace.json"
 
-    sub_questions = state.get("sub_questions", [])
-    sections = []
-    all_urls: list[str] = []
-    for sq in sub_questions:
-        if not isinstance(sq, SubQuestion):
-            continue
-        sections.append(sq.question)
-        for r in sq.results:
-            if r.url:
-                all_urls.append(r.url)
+    doc_id = state.get("doc_id", "")
+    sections: list[str] = []
+    if doc_id:
+        try:
+            from mariana.utils.store import get_toc
+            toc = get_toc(doc_id)
+            sections = [n["title"] for n in toc if n.get("status") == "complete"]
+        except Exception:
+            pass
 
+    all_urls: list[str] = list(state.get("scraped_urls", set()))
     domains = list({urlparse(u).netloc.replace("www.", "") for u in all_urls})
 
     trace = {

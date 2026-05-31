@@ -33,43 +33,25 @@ DISTILL_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
-    SystemMessagePromptTemplate.from_template(
-        """
-You are a research analyst. Extract only the key facts from the source
-that are directly relevant to the question. Be concise (2-4 sentences).
-If the source has no relevant information, output exactly: "Not relevant."
-Do not fabricate anything.
-"""
-    ),
-    HumanMessagePromptTemplate.from_template(
-        """
-Question: {question}
-
-Source ({source_title}, {source_url}):
-{content}
-
-Key facts relevant to the question:"""
-    ),
+    ("system",
+     "Read the source and extract the single most relevant fact or "
+     "insight that relates to the section topic. "
+     "One sentence only. Be specific — name entities, numbers, dates. "
+     "If the source is not relevant, output: NOT RELEVANT"),
+    ("human",
+     "Section: {section_title}\n"
+     "Source ({domain}):\n{content}"),
 ])
 
 SYNTHESIZE_PROMPT = ChatPromptTemplate.from_messages([
-    SystemMessagePromptTemplate.from_template(
-        """
-You are a research synthesizer. Combine the extracted findings below into
-a single coherent paragraph that directly answers the question.
-Be factual, concise, and cite sources as [source_title].
-Do not fabricate information.
-"""
-    ),
-    HumanMessagePromptTemplate.from_template(
-        """
-Question: {question}
-
-Extracted findings:
-{findings}
-
-Synthesized answer:"""
-    ),
+    ("system",
+     "Write a research section in 3-6 sentences. "
+     "Incorporate all provided findings naturally into flowing prose. "
+     "Be specific. No bullet points. No heading. "
+     "Do not start with 'This section' or 'The following'."),
+    ("human",
+     "Section title: {section_title}\n\n"
+     "Research findings:\n{points}"),
 ])
 
 SECTION_PROMPT = ChatPromptTemplate.from_messages([
@@ -173,3 +155,31 @@ Write the full report now.
     ),
 ])
 
+TOC_PLANNER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are planning the table of contents for a research report.\n"
+     "Generate exactly {n} section titles.\n"
+     "Rules:\n"
+     "- Output ONLY a numbered list. Nothing else.\n"
+     "- Each title: 2-5 words, a noun phrase, no question marks\n"
+     "- Cover key facets: basics, current state, challenges, future\n"
+     "- No generic titles like 'Introduction', 'Overview', 'Conclusion'\n"
+     "\n"
+     "Example for 'How does photosynthesis work':\n"
+     "1. Light Absorption Mechanisms\n"
+     "2. Calvin Cycle Chemistry\n"
+     "3. Efficiency And Limitations\n"
+     "4. Artificial Photosynthesis Research"),
+    ("human", "Research topic: {query}"),
+])
+
+FOLLOW_UP_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Based on the completed research section, suggest 1-2 related sub-topics "
+     "worth investigating further.\n"
+     "Output ONLY a numbered list. No explanations.\n"
+     "Each item: a 3-5 word noun phrase."),
+    ("human",
+     "Section: {section_title}\n\n"
+     "Content:\n{content}"),
+])

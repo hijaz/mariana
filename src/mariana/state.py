@@ -1,8 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Annotated, Any
-
-from langgraph.graph.message import add_messages
+from typing import Any
 
 
 @dataclass
@@ -88,19 +86,8 @@ class SubQuestion:
 
 class ResearchState(dict):
     query: str
-    sub_questions: list[SubQuestion]
-    iteration: int
-    gaps: list[str]
-    final_report: str
-    status: str
-    scraped_urls: set
-    messages: Annotated[list[Any], add_messages]
-    document_title: str
-    used_queries: set
-    session_domain_counts: dict
-    llm_call_count: int
-    # v0.6 additions
     doc_id: str
+    document_title: str
     goal_config: dict
     started_at: str
     should_stop: bool
@@ -108,28 +95,23 @@ class ResearchState(dict):
     total_sources_scraped: int
     total_words_written: int
     consecutive_empty_searches: int
+    llm_call_count: int
+    scraped_urls: set
+    session_domain_counts: dict
+    current_node_id: str
+    current_section_title: str
+    current_search_queries: list
+    query_generation: int
+    iteration: int
+    status: str
 
 
 def initial_state(query: str, goal: ResearchGoal | None = None) -> dict:
-    from mariana.utils.store import create_document, init_db
-    init_db()
-    doc_id = create_document(query)
     g = goal or ResearchGoal()
     return {
         "query": query,
-        "sub_questions": [],
-        "iteration": 0,
-        "gaps": [],
-        "final_report": "",
-        "status": "Starting...",
-        "scraped_urls": set(),
-        "messages": [],
+        "doc_id": "",  # set by init_document_node
         "document_title": "",
-        "used_queries": set(),
-        "session_domain_counts": {},
-        "llm_call_count": 0,
-        # v0.6
-        "doc_id": doc_id,
         "goal_config": g.to_dict(),
         "started_at": datetime.now().isoformat(),
         "should_stop": False,
@@ -137,4 +119,13 @@ def initial_state(query: str, goal: ResearchGoal | None = None) -> dict:
         "total_sources_scraped": 0,
         "total_words_written": 0,
         "consecutive_empty_searches": 0,
+        "llm_call_count": 0,
+        "scraped_urls": set(),
+        "session_domain_counts": {},
+        "current_node_id": "",
+        "current_section_title": "",
+        "current_search_queries": [],
+        "query_generation": 0,
+        "iteration": 0,
+        "status": "Starting...",
     }

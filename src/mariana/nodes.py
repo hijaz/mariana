@@ -1,34 +1,31 @@
-import json
+"""Research nodes — URL-by-URL incremental generation pipeline."""
 import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 from urllib.parse import urlparse
 
 from rich.console import Console
 
 from mariana.prompts import (
     CONCLUSION_PROMPT,
-    DISTILL_PROMPT,
     EXEC_SUMMARY_PROMPT,
-    EXTRACT_PROMPT,
+    FOLLOW_UP_PROMPT,
     QUERY_GENERATOR_PROMPT,
-    PLANNER_PROMPT,
-    REPORT_PROMPT,
-    SECTION_PROMPT,
     SUMMARIZE_NODE_PROMPT,
     SYNTHESIZE_PROMPT,
+    TOC_PLANNER_PROMPT,
 )
-from mariana.state import ResearchGoal, SearchResult, SubQuestion
+from mariana.state import ResearchGoal
 from mariana.tools.search import filter_for_diversity, raw_scrape, raw_search
 from mariana.utils.config import ensure_output_dir, load_config
 from mariana.utils.llm import get_planner_llm, get_summarizer_llm, truncate_for_llm
-from mariana.utils.report import write_partial_report
 from mariana.utils.retry import with_llm_retry
 from mariana.utils.store import (
     create_toc_node,
+    get_pending_sections,
     get_toc,
+    load_section_content,
     save_section_content,
     update_node_status,
     update_node_summary,
@@ -39,176 +36,44 @@ console = Console()
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 150
 
-# Phrases that indicate a vague, unhelpful summary — used in reflect heuristic
-_VAGUE_PHRASES = [
-    "in general",
-    "it depends",
-    "various factors",
-    "many aspects",
-    "further research",
-    "not enough information",
-    "unclear",
-    "it is difficult",
-]
+# Inline — spec defines these variables (section_title / domain / content)
+from langchain_core.prompts import ChatPromptTemplate as _CPT
+EXTRACT_PROMPT = _CPT.from_messages([
+    ("system",
+     "Read the source and extract the single most relevant fact or "
+     "insight that relates to the section topic. "
+     "One sentence only. Be specific — name entities, numbers, dates. "
+     "If the source is not relevant, output: NOT RELEVANT"),
+    ("human",
+     "Section: {section_title}\n"
+     "Source ({domain}):\n{content}"),
+])
 
-_STOP_WORDS = {
-    "what", "how", "why", "when", "where", "which", "who",
-    "are", "is", "the", "a", "an", "and", "or", "of", "in",
-    "to", "for", "with", "on", "at", "by", "from", "as",
-    "do", "does", "did", "have", "has", "had", "be", "been",
-    "describe", "explain", "compare", "contrast", "detail",
-    "specifically", "including", "particularly", "currently",
-    "work", "works", "tell", "give", "list", "about",
-}
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _render_llm_output(result: Any) -> str:
-    try:
-        generation = result.generations[0][0]
-    except Exception:
-        return ""
-    if hasattr(generation, "message"):
-        content = getattr(generation.message, "content", "") or ""
-        if content:
-            return content
-    return getattr(generation, "text", "") or ""
-
+# ── Pure helpers ──────────────────────────────────────────────────────────────
 
 def _parse_numbered_list(text: str) -> list[str]:
-    """Extract only lines that begin with a digit prefix like '1.' or '2)'."""
-    lines = text.strip().splitlines()
+    """Extract lines beginning with a digit prefix like '1.' or '2)'."""
     items = []
-    for line in lines:
-        match = re.match(r"^\s*\d+[.)]\s+(.+)$", line)
-        if match:
-            item = match.group(1).strip()
+    for line in text.strip().splitlines():
+        m = re.match(r"^\s*\d+[.)]\s+(.+)$", line)
+        if m:
+            item = m.group(1).strip()
             if item:
                 items.append(item)
     return items
 
 
-def _extract_keywords(question: str) -> str:
-    """Deterministic fallback keyword extractor — no LLM call."""
-    clean = re.sub(r"\*\*.*?\*\*:?\s*", "", question)
-    words = re.findall(r"\b[a-zA-Z]{3,}\b", clean)
-    keywords = [w.lower() for w in words if w.lower() not in _STOP_WORDS]
-    return " ".join(keywords[:6])
-
-
-_LEADING_STRIP = {'how', 'what', 'why', 'when', 'where', 'which', 'does', 'do', 'is', 'are', 'can', 'will'}
-_TRAILING_STRIP = {'how', 'work', 'works', 'do', 'does', 'like', 'mean', 'about'}
-
-
-def _strip_function_words(words: list[str]) -> list[str]:
-    """Remove leading/trailing function words that add no search value."""
-    while words and words[0].lower() in _LEADING_STRIP:
-        words = words[1:]
-    while words and words[-1].lower() in _TRAILING_STRIP:
-        words = words[:-1]
-    return words
-
-
-def validate_and_clean_query(raw: str, fallback_question: str) -> str:
-    """Strip markdown artifacts from a distilled query; fall back to keyword extraction."""
-    cleaned = raw.strip()
-    cleaned = re.sub(r"`+", "", cleaned)
-    cleaned = re.sub(r"\*+", "", cleaned)
-    cleaned = re.sub(r"^#+\s*", "", cleaned)
-    cleaned = re.sub(r"[\[\](){}'\"']", "", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-
-    words = [w for w in cleaned.split() if len(w) > 1]
-    words = _strip_function_words(words)
-
-    if len(words) == 0 or len(words) > 10:
-        fallback = _extract_keywords(fallback_question)
-        console.print(f"  [dim][distill] fallback triggered (raw: {repr(raw[:40])}) → {fallback!r}[/]")
-        return fallback
-
-    return " ".join(words[:7])
-
-
-def _clean_heading(question: str) -> str:
-    """Convert a verbose sub-question into a concise section heading."""
-    # Remove bold label prefixes: **Background & Principles:** or **Label:**
-    text = re.sub(r"\*\*[^*]+\*\*:?\s*", "", question)
-    # Remove parenthetical examples: (e.g., tokamaks), (including ...)
-    text = re.sub(r"\([^)]{0,80}\)", "", text)
-    # Take only the first clause — stop at first ? , ; – or double space
-    for delimiter in ["?", ",", ";", "–", "  "]:
-        if delimiter in text:
-            text = text.split(delimiter)[0]
-            break
-    text = text.strip().rstrip(":").strip()
-    # Hard cap at 55 chars
-    return text[:55] if len(text) > 55 else (text or question[:40])
-
-
-def _unique_query(query: str, used: set) -> str:
-    """Return query deduplicated against already-used queries."""
-    if query not in used:
-        used.add(query)
-        return query
-    for suffix in ["overview", "explained", "research 2024", "latest"]:
-        candidate = f"{query} {suffix}"
-        if candidate not in used:
-            used.add(candidate)
-            return candidate
-    return query
+_QUERY_STOP = {
+    'how', 'does', 'do', 'what', 'why', 'when', 'where', 'is', 'are',
+    'the', 'a', 'an', 'and', 'or', 'of', 'in', 'to', 'for', 'work',
+    'works', 'explain', 'describe', 'tell', 'me', 'about', 'can', 'will',
+}
 
 
 def _extract_topic_keywords(query: str) -> list[str]:
     """Return the most content-bearing words from the research query."""
-    QUERY_STOP = {
-        'how', 'does', 'do', 'what', 'why', 'when', 'where', 'is', 'are',
-        'the', 'a', 'an', 'and', 'or', 'of', 'in', 'to', 'for', 'work',
-        'works', 'explain', 'describe', 'tell', 'me', 'about', 'can', 'will',
-    }
     words = re.findall(r'\b[a-zA-Z]{3,}\b', query.lower())
-    return [w for w in words if w not in QUERY_STOP][:3]
-
-
-def _inject_topic(search_query: str, topic_keywords: list[str]) -> str:
-    """Prepend the primary topic keyword if the query contains none."""
-    query_lower = search_query.lower()
-    if any(kw in query_lower for kw in topic_keywords):
-        return search_query
-    prefix = topic_keywords[0] if topic_keywords else ""
-    return f"{prefix} {search_query}".strip() if prefix else search_query
-
-
-_GENERIC_HEADINGS = {
-    'introduction', 'overview', 'background', 'conclusion',
-    'challenges', 'applications', 'future directions', 'current research',
-    'fundamental physics', 'summary', 'history', 'related work',
-    'potential applications', 'future directions research',
-    'challenges and obstacles', 'current research developments',
-}
-
-
-def _parse_toc_json(text: str, query: str) -> dict:
-    """Parse orchestrator JSON output, hard-capping sections and normalising field names."""
-    text = re.sub(r'```(?:json)?', '', text).strip().rstrip('`').strip()
-    try:
-        toc = json.loads(text)
-    except json.JSONDecodeError:
-        return {"title": query.title(), "sections": []}
-    # Normalise 'queries' → 'search_queries' (new schema uses 'queries')
-    for section in toc.get("sections", []):
-        if "queries" in section and "search_queries" not in section:
-            section["search_queries"] = section.pop("queries")
-    # Hard cap — never more than max_sections
-    cfg = load_config()
-    toc["sections"] = toc.get("sections", [])[:cfg.max_sections]
-    return toc
-
-
-def _sources_are_on_topic(sources: list, topic_keywords: list[str]) -> bool:
-    """Return True if any source contains at least one topic keyword in the first 500 chars."""
-    combined = " ".join(r.content[:500] for r in sources if r.content).lower()
-    return any(kw in combined for kw in topic_keywords)
+    return [w for w in words if w not in _QUERY_STOP][:3]
 
 
 FALLBACK_ANGLES = [
@@ -219,53 +84,16 @@ FALLBACK_ANGLES = [
 ]
 
 
-def _deterministic_queries(query: str, n: int) -> list[str]:
+def _deterministic_queries(topic: str, n: int) -> list[str]:
     """Generate n topic-specific search queries without any LLM call."""
-    keywords = _extract_topic_keywords(query)
-    kw0 = keywords[0] if keywords else query.split()[0].lower()
+    keywords = _extract_topic_keywords(topic)
+    kw0 = keywords[0] if keywords else topic.split()[0].lower()
     kw1 = keywords[1] if len(keywords) > 1 else ""
     queries = []
     for template in FALLBACK_ANGLES[:n]:
-        q = template.format(kw0=kw0, kw1=kw1).strip()
-        q = re.sub(r'\s+', ' ', q).strip()
+        q = re.sub(r'\s+', ' ', template.format(kw0=kw0, kw1=kw1)).strip()
         queries.append(q)
     return queries
-
-
-
-
-def _inc_llm(state: dict) -> None:
-    """Increment llm_call_count in state (in-place, best-effort)."""
-    try:
-        state["llm_call_count"] = state.get("llm_call_count", 0) + 1
-    except Exception:
-        pass
-
-
-@with_llm_retry
-def _llm_plan(query: str, gaps: str, num_questions: int) -> str:
-    prompt = PLANNER_PROMPT.format_prompt(
-        query=truncate_for_llm(query, "query"),
-        gaps=truncate_for_llm(gaps, "gaps"),
-        num_questions=num_questions,
-    )
-    return _render_llm_output(get_planner_llm().generate_prompt([prompt])).strip()
-
-
-@with_llm_retry
-def _llm_distill_raw(question: str) -> str:
-    """Call LLM to distill a search query. Returns raw output before validation."""
-    prompt = DISTILL_PROMPT.format_prompt(question=truncate_for_llm(question, "question"))
-    return _render_llm_output(get_planner_llm().generate_prompt([prompt])).strip()
-
-
-def _llm_distill(question: str, used_queries: set) -> str:
-    """Distill a search query, validate, deduplicate against used set."""
-    raw = _llm_distill_raw(question)
-    # Take first non-empty line only
-    raw = next((line.strip() for line in raw.splitlines() if line.strip()), raw)
-    cleaned = validate_and_clean_query(raw, question)
-    return _unique_query(cleaned, used_queries)
 
 
 def _chunk_content(text: str) -> list[str]:
@@ -284,49 +112,60 @@ def _chunk_content(text: str) -> list[str]:
     return chunks
 
 
+def _should_skip(url: str) -> bool:
+    """True for URLs that never contain research content."""
+    skip = [
+        'google.com/search', 'bing.com/search', 'yahoo.com/search',
+        'amazon.com/', 'twitter.com/', 'x.com/status', 'facebook.com/',
+        'instagram.com/', 'youtube.com/results', 'linkedin.com/in/',
+        '/login', '/signup', '/register', '/cart', '/checkout',
+    ]
+    return any(p in url for p in skip)
+
+
+# ── LLM helpers ───────────────────────────────────────────────────────────────
+
 @with_llm_retry
-def _llm_extract_chunk(question: str, domain: str, content: str) -> str:
-    prompt = EXTRACT_PROMPT.format_prompt(
-        question=truncate_for_llm(question, "question"),
-        source_title=domain,
-        source_url=domain,
-        content=content,  # already chunked to CHUNK_SIZE
-    )
-    return _render_llm_output(get_summarizer_llm().generate_prompt([prompt])).strip()
-
-
-def _extract_from_source(source: SearchResult, question: str) -> tuple[str, int]:
-    """Extract key points from one source, chunked if long. Returns (text, llm_calls)."""
-    chunks = _chunk_content(source.content or "")
-    domain = urlparse(source.url).netloc.replace("www.", "")
+def _extract_best_point(chunks: list[str], section_title: str, domain: str, llm) -> str:
+    """
+    Run EXTRACT_PROMPT over each chunk.
+    Join valid results; return empty string if nothing relevant found.
+    """
     points = []
-    calls = 0
     for chunk in chunks:
-        point = _llm_extract_chunk(question, domain, chunk)
-        calls += 1
-        if point and "NOT RELEVANT" not in point.upper() and len(point) > 20:
+        result = (EXTRACT_PROMPT | llm).invoke({
+            "section_title": section_title,
+            "domain": domain,
+            "content": chunk,
+        })
+        point = (getattr(result, "content", None) or "").strip()
+        if point and "NOT RELEVANT" not in point.upper() and len(point) > 15:
             points.append(point)
-    if not points:
-        return "", calls
-    return " ".join(points), calls
+    return " ".join(points)
 
 
 @with_llm_retry
-def _llm_synthesize(question: str, findings: str) -> str:
-    prompt = SYNTHESIZE_PROMPT.format_prompt(
-        question=truncate_for_llm(question, "question"),
-        findings=truncate_for_llm(findings, "findings"),
-    )
-    return _render_llm_output(get_summarizer_llm().generate_prompt([prompt])).strip()
+def _synthesize_section(section_title: str, points: list[str], llm) -> str:
+    """Synthesize a list of one-sentence findings into flowing prose."""
+    result = (SYNTHESIZE_PROMPT | llm).invoke({
+        "section_title": section_title,
+        "points": "\n".join(f"- {p}" for p in points),
+    })
+    return (getattr(result, "content", None) or "").strip()
 
 
 @with_llm_retry
-def _llm_section(question: str, summary: str) -> str:
-    prompt = SECTION_PROMPT.format_prompt(
-        question=truncate_for_llm(question, "question"),
-        summary=truncate_for_llm(summary, "summary"),
-    )
-    return _render_llm_output(get_summarizer_llm().generate_prompt([prompt])).strip()
+def _llm_generate_queries_raw(topic: str, n: int) -> str:
+    chain = QUERY_GENERATOR_PROMPT | get_planner_llm()
+    result = chain.invoke({"query": truncate_for_llm(topic, "query"), "n": n})
+    return (getattr(result, "content", None) or "").strip()
+
+
+@with_llm_retry
+def _llm_section_titles_raw(query: str, n: int) -> str:
+    chain = TOC_PLANNER_PROMPT | get_planner_llm()
+    result = chain.invoke({"query": truncate_for_llm(query, "query"), "n": n})
+    return (getattr(result, "content", None) or "").strip()
 
 
 @with_llm_retry
@@ -340,517 +179,360 @@ def _llm_conclusion(query: str, findings: str) -> str:
 
 
 @with_llm_retry
-def _llm_exec_summary(query: str, summary_inputs: str) -> str:
-    prompt = EXEC_SUMMARY_PROMPT.format_prompt(
-        query=truncate_for_llm(query, "query"),
-        section_texts=truncate_for_llm(summary_inputs, "exec_summary_inputs"),
-    )
-    return _render_llm_output(get_summarizer_llm().generate_prompt([prompt])).strip()
-
-
-@with_llm_retry
-def _llm_generate_queries_raw(query: str, n: int) -> str:
-    """Ask the LLM for n search queries as a numbered list."""
-    chain = QUERY_GENERATOR_PROMPT | get_planner_llm()
+def _llm_exec_summary(query: str, section_texts: str) -> str:
+    chain = EXEC_SUMMARY_PROMPT | get_summarizer_llm()
     result = chain.invoke({
         "query": truncate_for_llm(query, "query"),
-        "n": n,
+        "section_texts": truncate_for_llm(section_texts, "section_texts"),
     })
     return (getattr(result, "content", None) or "").strip()
 
 
-def _llm_generate_queries(query: str, n: int) -> list[str]:
-    """Call LLM to generate n search queries; parse numbered list output."""
-    raw = _llm_generate_queries_raw(query, n)
-    return _parse_numbered_list(raw)
-
-
-# ── Nodes ─────────────────────────────────────────────────────────────────────
-
-def orchestrator_node(state: dict) -> dict:
-    """Plan research by generating N targeted search queries as a numbered list."""
-    query = state.get("query", "")
-    gaps = state.get("gaps", []) or []
-    cfg = load_config()
-    used_queries: set = set(state.get("used_queries") or set())
-    topic_keywords = _extract_topic_keywords(query)
-
-    console.print(f"[yellow]Planning[/] research for: [bold]{query}[/]")
-    if gaps:
-        console.print(f"[yellow]Addressing gaps[/]: {', '.join(g[:50] for g in gaps)}")
-
-    # Focus on gaps when present, otherwise research fresh
-    planner_query = (
-        f"{query} — specifically: {', '.join(gaps[:3])}" if gaps else query
-    )
-
-    raw_queries = _llm_generate_queries(planner_query, cfg.max_sections)
-
-    # Validate every query and inject topic keywords as safety net
-    validated: list[str] = []
-    for q in raw_queries:
-        if not q.strip():
-            continue
-        clean = validate_and_clean_query(q, query)
-        validated.append(_inject_topic(clean, topic_keywords))
-    validated = [q for q in validated if q][:cfg.max_sections]
-
-    # Deterministic fallback — always produce min_sections good queries
-    if len(validated) < cfg.min_sections:
-        console.print(
-            f"[yellow]Planner returned {len(validated)} queries "
-            f"(min {cfg.min_sections}) — using deterministic fallback[/]"
-        )
-        validated = _deterministic_queries(query, cfg.max_sections)
-
-    # Build SubQuestion objects — query text doubles as heading and search query
-    existing = {
-        sq.question: sq
-        for sq in state.get("sub_questions", [])
-        if isinstance(sq, SubQuestion) and sq.answered
-    }
-    sub_questions: list[SubQuestion] = []
-    for q in validated:
-        heading = q.title()
-        deduped = _unique_query(q, used_queries)
-        if heading in existing:
-            existing[heading].search_queries = [deduped]
-            sub_questions.append(existing[heading])
-        else:
-            sub_questions.append(SubQuestion(question=heading, search_queries=[deduped]))
-
-    document_title = query.title()
-    console.print(f"[yellow]Sections:[/] {', '.join(sq.question[:40] for sq in sub_questions)}")
-    return {
-        "sub_questions": sub_questions,
-        "document_title": document_title,
-        "used_queries": used_queries,
-        "llm_call_count": state.get("llm_call_count", 0) + 1,
-        "status": f"Planned {len(sub_questions)} sections",
-    }
-
-
-def plan_node(state: dict) -> dict:
-    """Legacy planner (used if orchestrator is bypassed). Outputs numbered sub-questions."""
-    query = state.get("query", "")
-    gaps = state.get("gaps", []) or []
-    gaps_text = "\n".join(f"- {gap}" for gap in gaps) if gaps else "None yet"
-    cfg = load_config()
-    console.print(f"[yellow]Planning[/] query: [bold]{query}[/]")
-    if gaps:
-        console.print(f"[yellow]Existing gaps[/]: {', '.join(gaps)}")
-
-    answer = _llm_plan(query, gaps_text, cfg.num_subquestions)
-    _inc_llm(state)
-    questions = _parse_numbered_list(answer)
-
-    existing = {
-        sq.question: sq
-        for sq in state.get("sub_questions", [])
-        if isinstance(sq, SubQuestion) and sq.answered
-    }
-    new_sub_questions = []
-    for question in questions:
-        if question in existing:
-            new_sub_questions.append(existing[question])
-        else:
-            new_sub_questions.append(SubQuestion(question=question))
-
-    return {
-        "sub_questions": new_sub_questions,
-        "llm_call_count": state.get("llm_call_count", 0) + 1,
-        "status": f"Planned {len(new_sub_questions)} sub-questions",
-    }
-
-
-def search_node(state: dict) -> dict:
-    cfg = load_config()
-    sub_questions = state.get("sub_questions", [])
-    scraped_urls: set = set(state.get("scraped_urls") or set())
-    used_queries: set = set(state.get("used_queries") or set())
-    session_domain_counts: dict = dict(state.get("session_domain_counts") or {})
-    console.print(f"[cyan]Searching[/] {len(sub_questions)} sub-question(s), max {cfg.max_results} results each")
-    updated_questions = []
-
-    for sq in sub_questions:
-        if not isinstance(sq, SubQuestion):
-            updated_questions.append(sq)
-            continue
-        if sq.answered:
-            updated_questions.append(sq)
-            continue
-
-        # Use pre-validated search_queries from orchestrator if available; else distill on the fly
-        if sq.search_queries:
-            search_queries = [
-                _unique_query(q, used_queries) for q in sq.search_queries
-            ]
-        else:
-            search_queries = [_llm_distill(sq.question, used_queries)]
-            _inc_llm(state)
-
-        all_results: list[SearchResult] = []
-        section_domain_counts: dict = {}
-
-        for search_query in search_queries:
-            console.print(f"[cyan]Query:[/] [italic]{search_query}[/] (for: [bold]{sq.question[:60]}[/])")
-            raw_results = raw_search(search_query, cfg.searxng_port, cfg.max_results)
-            if not raw_results:
-                console.print(f"[red]No results for:[/] {search_query}")
-                continue
-
-            # Domain diversity filter
-            diverse = filter_for_diversity(raw_results, section_domain_counts, session_domain_counts)
-
-            for idx, item in enumerate(diverse, start=1):
-                url = item.get("url", "")
-                title = item.get("title", "[no title]")
-                console.print(f"  • {idx}/{len(diverse)}: [bold]{title}[/] ({url})")
-                if url in scraped_urls:
-                    console.print(f"    Already scraped — skipping")
-                    content = ""
-                else:
-                    content = raw_scrape(url, cfg.max_page_chars)
-                    if content:
-                        scraped_urls.add(url)
-                console.print(f"    {len(content):,} chars scraped")
-                all_results.append(SearchResult(title=title, url=url, snippet=item.get("snippet", ""), content=content))
-                # Adaptive delay: shorter when we got good content
-                if idx < len(diverse):
-                    delay = cfg.search_delay_seconds * (0.5 if len(content) > 500 else 1.0)
-                    time.sleep(delay)
-
-            if len(raw_results) > 1:
-                time.sleep(cfg.search_delay_seconds)
-
-        sq.results = all_results
-        updated_questions.append(sq)
-
-    return {
-        "sub_questions": updated_questions,
-        "scraped_urls": scraped_urls,
-        "used_queries": used_queries,
-        "session_domain_counts": session_domain_counts,
-        "consecutive_empty_searches": (
-            state.get("consecutive_empty_searches", 0) + 1
-            if all(not sq.results for sq in updated_questions if isinstance(sq, SubQuestion) and not sq.answered)
-            else 0
-        ),
-        "status": "Search complete",
-    }
-
-
-def summarize_node(state: dict) -> dict:
-    """Map-reduce summarization: chunk-extract per source, then synthesize."""
-    sub_questions = state.get("sub_questions", [])
-    llm_calls = state.get("llm_call_count", 0)
-    topic_keywords = _extract_topic_keywords(state.get("query", ""))
-
-    for sq in sub_questions:
-        if not isinstance(sq, SubQuestion):
-            continue
-        if sq.answered or not sq.results:
-            continue
-
-        usable = [r for r in sq.results if len(r.content or "") > 200]
-        sq.total_scraped_chars = sum(len(r.content or "") for r in usable)
-
-        console.print(
-            f"[magenta]Summarizing[/] [bold]{sq.question[:70]}[/] "
-            f"— {len(usable)}/{len(sq.results)} usable ({sq.total_scraped_chars:,} chars)"
-        )
-
-        if not usable:
-            console.print(f"  [red]No usable sources — marking unanswered[/]")
-            continue
-
-        # Skip sections where all scraped content is off-topic
-        if topic_keywords and not _sources_are_on_topic(usable, topic_keywords):
-            console.print(
-                f"  [red]Sources off-topic (no '{', '.join(topic_keywords)}' found) — skipping[/]"
-            )
-            sq.answered = False
-            sq.search_queries = [
-                _inject_topic(q, topic_keywords) for q in (sq.search_queries or [])
-            ]
-            continue
-
-        findings: list[str] = []
-        for idx, result in enumerate(usable, start=1):
-            console.print(f"  • Extracting [{idx}/{len(usable)}]: [bold]{result.title or 'Untitled'}[/]")
-            extracted, calls = _extract_from_source(result, sq.question)
-            llm_calls += calls
-            if extracted:
-                domain = urlparse(result.url).netloc.replace("www.", "")
-                findings.append(f"[{domain}]: {extracted}")
-
-        if not findings:
-            console.print(f"  [red]All sources not relevant — marking unanswered[/]")
-            continue
-
-        findings_text = "\n\n".join(findings)
-        sq.summary = _llm_synthesize(sq.question, findings_text)
-        llm_calls += 1
-        sq.answered = True
-        console.print(f"  ✓ {len(sq.summary)} chars")
-
-    partial_path = write_partial_report(state)
-    console.print(f"[dim]Partial report: {partial_path}[/]")
-
-    return {
-        "sub_questions": sub_questions,
-        "llm_call_count": llm_calls,
-        "status": "Summarization complete",
-    }
-
-
-def reflect_node(state: dict) -> dict:
-    """Deterministic quality check — no LLM call."""
-    cfg = load_config()
-    iteration = state.get("iteration", 0) + 1
-    console.print(f"[blue]Reflecting[/] iteration {iteration}/{cfg.max_iterations}")
-
-    if iteration >= cfg.max_iterations:
-        console.print("[blue]Max iterations reached.[/] Moving to report.")
-        return {"iteration": iteration, "gaps": [], "status": f"Iteration {iteration} complete"}
-
-    sub_questions = state.get("sub_questions", [])
-    gaps: list[str] = []
-
-    unanswered = [sq.question for sq in sub_questions if isinstance(sq, SubQuestion) and not sq.answered]
-    gaps.extend(unanswered)
-    if unanswered:
-        console.print(f"[blue]Unanswered sub-questions re-queued:[/] {len(unanswered)}")
-
-    for sq in sub_questions:
-        if not isinstance(sq, SubQuestion) or not sq.answered:
-            continue
-        if sq.total_scraped_chars < 500:
-            console.print(f"  [yellow]Low content ({sq.total_scraped_chars} chars):[/] {sq.question[:55]}")
-            if sq.question not in gaps:
-                gaps.append(sq.question)
-            continue
-        if len(sq.summary or "") < 50:
-            console.print(f"  [yellow]Summary too short ({len(sq.summary)} chars):[/] {sq.question[:55]}")
-            if sq.question not in gaps:
-                gaps.append(sq.question)
-            continue
-        summary_lower = (sq.summary or "").lower()
-        vague_count = sum(1 for p in _VAGUE_PHRASES if p in summary_lower)
-        if vague_count > 4:
-            console.print(f"  [yellow]Vague summary ({vague_count} phrases):[/] {sq.question[:55]}")
-            if sq.question not in gaps:
-                gaps.append(sq.question)
-
-    if iteration < 2 and not gaps:
-        console.print("[blue]Minimum 2 iterations not yet reached — continuing.[/]")
-        unanswered_now = [sq.question for sq in sub_questions if isinstance(sq, SubQuestion) and not sq.answered]
-        if unanswered_now:
-            gaps = unanswered_now
-
-    if gaps:
-        console.print(f"[blue]Gaps:[/] {', '.join(g[:40] for g in gaps)}")
-    else:
-        console.print("[blue]No gaps.[/] Ready to generate report.")
-
-    return {"iteration": iteration, "gaps": gaps, "status": f"Iteration {iteration} complete"}
-
-
-def report_node(state: dict) -> dict:
-    """Generate a per-section report with proper exec summary and LLM conclusion."""
-    cfg = load_config()
-    query = state.get("query", "")
-    document_title = state.get("document_title", "") or f"Research Report: {query}"
-    answered = [sq for sq in state.get("sub_questions", []) if isinstance(sq, SubQuestion) and sq.answered]
-    llm_calls = state.get("llm_call_count", 0)
-    console.print(f"[green]Generating report[/] — {len(answered)} section(s)")
-
-    # Generate each section body
-    sections: list[tuple[str, str]] = []
-    for sq in answered:
-        heading = _clean_heading(sq.question)
-        console.print(f"  • Section: [bold]{heading}[/]")
-        body = _llm_section(sq.question, sq.summary)
-        llm_calls += 1
-        sections.append((heading, body))
-
-    # Executive summary: built from sq.summary fields (short, ≤300 chars each)
-    summary_inputs = "\n\n".join(
-        f"{_clean_heading(sq.question)}:\n{sq.summary}"
-        for sq in answered
-        if sq.summary
-    )
-    exec_summary = _llm_exec_summary(query, summary_inputs)
-    llm_calls += 1
-
-    # Conclusion: also from sq.summary fields
-    conclusion = _llm_conclusion(query, summary_inputs)
-    llm_calls += 1
-
-    # Assemble report
-    lines = [f"# {document_title}\n"]
-    lines.append("## Summary\n")
-    lines.append(exec_summary)
-    lines.append("")
-    for heading, body in sections:
-        lines.append(f"\n## {heading}\n")
-        lines.append(body)
-        lines.append("")
-    lines.append("\n## Conclusion\n")
-    lines.append(conclusion)
-    report = "\n".join(lines)
-
-    output_dir = ensure_output_dir(cfg)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    sanitized = re.sub(r"[^a-z0-9]+", "_", query.lower())[:40].strip("_")
-    filename = f"{timestamp}_{sanitized or 'report'}.md"
-    filepath = output_dir / filename
-    filepath.write_text(report, encoding="utf-8")
-
-    console.print(f"[green]Report →[/] {filepath}")
-    return {
-        "final_report": report,
-        "llm_call_count": llm_calls,
-        "status": f"Report saved to {filepath}",
-    }
-
-
-# ── Helper: generate a one-sentence node summary ─────────────────────────────
-
 def _generate_node_summary(title: str, text: str) -> str:
-    """Generate a short summary sentence for a completed section."""
+    """Generate a one-sentence summary for a completed section."""
     try:
         chain = SUMMARIZE_NODE_PROMPT | get_summarizer_llm()
         result = chain.invoke({"title": title, "text": text[:1200]})
-        return getattr(result, "content", "").strip()
+        return (getattr(result, "content", None) or "").strip()
     except Exception:
         return text[:80].replace("\n", " ")
 
 
-# ── save_to_store_node ────────────────────────────────────────────────────────
+def _seed_queries_from_content(
+    doc_id: str,
+    node_id: str,
+    section_title: str,
+    content: str,
+    current_generation: int,
+    llm,
+) -> None:
+    """Generate follow-up topics from completed section for forever-mode expansion."""
+    if current_generation >= 2:
+        return
+    existing_toc = get_toc(doc_id)
+    if len(existing_toc) >= 8:
+        return
+    try:
+        result = (FOLLOW_UP_PROMPT | llm).invoke({
+            "section_title": section_title,
+            "content": content[:600],
+        })
+        topics = _parse_numbered_list(getattr(result, "content", "") or "")
+    except Exception:
+        return
+    existing_titles = {n["title"].lower() for n in existing_toc}
+    added = 0
+    for topic in topics[:2]:
+        clean = topic.strip().title()
+        if clean.lower() not in existing_titles:
+            create_toc_node(doc_id, clean, depth=1, order_index=100 + len(existing_toc) + added)
+            added += 1
+    if added:
+        console.print(f"  [dim]Seeded {added} follow-up topic(s)[/]")
 
-def save_to_store_node(state: dict) -> dict:
-    """
-    Persist completed sub-question sections to the SQLite document store.
-    Creates toc_nodes for new sections, saves content, and generates summaries.
-    """
-    doc_id = state.get("doc_id", "")
-    if not doc_id:
-        return {}
 
-    sub_questions = state.get("sub_questions", [])
-    llm_calls = state.get("llm_call_count", 0)
-    total_words = state.get("total_words_written", 0)
-    total_sources = state.get("total_sources_scraped", 0)
+# ── Report helpers ────────────────────────────────────────────────────────────
 
-    # Build a map of existing toc_nodes for this document
-    existing_toc = {n["title"]: n for n in get_toc(doc_id)}
+def _write_incremental_report(
+    doc_id: str,
+    query: str,
+    document_title: str,
+    cfg,
+) -> Path | None:
+    """Write the current state of the report from all completed sections in the DB."""
+    sections = [n for n in get_toc(doc_id) if n["status"] == "complete" and n["depth"] == 0]
+    if not sections:
+        return None
+    output_dir = ensure_output_dir(cfg)
+    filepath = output_dir / f"{doc_id[:8]}_partial.md"
+    title = document_title or query.title()
+    lines = [f"# {title}\n", "*Research in progress…*\n"]
+    for node in sorted(sections, key=lambda n: n["order_index"]):
+        content = load_section_content(node["id"])
+        if content:
+            lines.append(f"\n## {node['title']}\n")
+            lines.append(content)
+            lines.append("")
+    filepath.write_text("\n".join(lines), encoding="utf-8")
+    return filepath
 
-    answered_count = 0
-    for idx, sq in enumerate(sub_questions):
-        if not isinstance(sq, SubQuestion) or not sq.answered or not sq.summary:
-            continue
 
-        title = sq.question
-        if title not in existing_toc:
-            node_id = create_toc_node(doc_id, title, depth=0, order_index=idx)
-        else:
-            node_id = existing_toc[title]["id"]
+# ── Nodes ─────────────────────────────────────────────────────────────────────
 
-        save_section_content(node_id, sq.summary)
-        update_node_status(node_id, "complete")
-
-        # Generate and store node summary
-        summary_text = _generate_node_summary(title, sq.summary)
-        update_node_summary(node_id, summary_text)
-        llm_calls += 1
-
-        word_count = len(sq.summary.split())
-        total_words += word_count
-        answered_count += 1
-        console.print(f"  [dim]Saved section:[/] {title[:55]} ({word_count}w)")
-
-    # Count scraped sources
-    total_sources = sum(
-        1
-        for sq in sub_questions
-        if isinstance(sq, SubQuestion)
-        for r in sq.results
-        if r.url
-    )
-
+def init_document_node(state: dict) -> dict:
+    """Create the DB document record and derive document_title."""
+    from mariana.utils.store import create_document, init_db
+    cfg = load_config()
+    init_db()
+    query = state["query"]
+    doc_id = create_document(query)
+    # Simple title: capitalise query, cap at 60 chars
+    title = query.strip().rstrip("?").title()[:60]
     return {
-        "llm_call_count": llm_calls,
-        "total_words_written": total_words,
-        "total_sources_scraped": total_sources,
-        "status": f"Saved {answered_count} section(s) to store",
+        "doc_id": doc_id,
+        "document_title": title,
+        "status": "Document initialised",
     }
 
 
-# ── check_completion_node ─────────────────────────────────────────────────────
+def plan_toc_node(state: dict) -> dict:
+    """Generate section titles and insert them as toc_nodes."""
+    cfg = load_config()
+    query = state["query"]
+    doc_id = state["doc_id"]
+    goal_cfg = state.get("goal_config", {})
+    g = ResearchGoal.from_dict(goal_cfg)
+
+    # How many sections?
+    n = min(g.max_sources // 3, 6) if g.max_sources else 5
+    n = max(n, 3)
+
+    try:
+        raw = _llm_section_titles_raw(query, n)
+        titles = _parse_numbered_list(raw)
+        if len(titles) < 2:
+            raise ValueError("Not enough titles")
+    except Exception:
+        titles = _deterministic_queries(query, n)
+
+    for idx, title in enumerate(titles[:n]):
+        create_toc_node(doc_id, title, depth=0, order_index=idx)
+
+    console.print(f"[bold]TOC:[/] {len(titles[:n])} sections planned")
+    return {
+        "llm_call_count": state.get("llm_call_count", 0) + 1,
+        "status": f"TOC planned: {len(titles[:n])} sections",
+    }
+
+
+def select_section_node(state: dict) -> dict:
+    """Pick the next pending section and load it into state."""
+    doc_id = state["doc_id"]
+    pending = get_pending_sections(doc_id)
+    if not pending:
+        # Safety valve — shouldn't happen normally
+        return {
+            "should_stop": True,
+            "stop_reason": "No pending sections remaining",
+            "status": "No sections left",
+        }
+    section = pending[0]
+    update_node_status(section["id"], "active")
+    return {
+        "current_node_id": section["id"],
+        "current_section_title": section["title"],
+        "current_search_queries": [],
+        "query_generation": state.get("query_generation", 0),
+        "status": f"Working on: {section['title']}",
+    }
+
+
+def generate_queries_node(state: dict) -> dict:
+    """Generate search queries for the current section."""
+    cfg = load_config()
+    section_title = state["current_section_title"]
+    query = state["query"]
+    gen = state.get("query_generation", 0)
+
+    combined_topic = f"{query} — {section_title}"
+    try:
+        raw = _llm_generate_queries_raw(combined_topic, 4)
+        queries = _parse_numbered_list(raw)
+        if not queries:
+            raise ValueError("No queries generated")
+    except Exception:
+        queries = _deterministic_queries(combined_topic, 4)
+
+    return {
+        "current_search_queries": queries,
+        "query_generation": gen + 1,
+        "llm_call_count": state.get("llm_call_count", 0) + 1,
+        "status": f"Generated {len(queries)} queries for: {section_title}",
+    }
+
+
+def process_section_node(state: dict) -> dict:
+    """
+    For each query → search → for each URL: scrape → extract one point →
+    resynthesize section → save to DB → write partial report.
+
+    This is the core URL-by-URL incremental loop.
+    """
+    cfg = load_config()
+    llm = get_summarizer_llm()
+
+    doc_id = state["doc_id"]
+    section_title = state["current_section_title"]
+    node_id = state["current_node_id"]
+    queries = state.get("current_search_queries", [])
+    query = state["query"]
+    goal_cfg = state.get("goal_config", {})
+    g = ResearchGoal.from_dict(goal_cfg)
+
+    scraped_urls: set = state.get("scraped_urls", set())
+    session_domain_counts: dict = state.get("session_domain_counts", {})
+    total_sources = state.get("total_sources_scraped", 0)
+    total_words = state.get("total_words_written", 0)
+    llm_calls = state.get("llm_call_count", 0)
+    consec_empty = state.get("consecutive_empty_searches", 0)
+
+    # Load any previously accumulated points for this section
+    existing_content = load_section_content(node_id) or ""
+    points: list[str] = [
+        line.lstrip("- ").strip()
+        for line in existing_content.splitlines()
+        if line.startswith("- ")
+    ] if existing_content.startswith("- ") else []
+    # If content is already synthesised prose, keep it and treat as 1 point
+    if existing_content and not points:
+        points = [existing_content[:600]]
+
+    goal_met = g.max_sources and total_sources >= g.max_sources
+    stop_processing = False
+
+    for search_query in queries:
+        if stop_processing:
+            break
+        if goal_met:
+            stop_processing = True
+            break
+
+        try:
+            raw_results = raw_search(search_query)
+        except Exception as exc:
+            console.print(f"  [yellow]Search error:[/] {exc}")
+            raw_results = []
+
+        diverse_results = filter_for_diversity(raw_results, session_domain_counts, cfg=cfg)
+
+        if not diverse_results:
+            consec_empty += 1
+        else:
+            consec_empty = 0
+
+        for result in diverse_results:
+            if stop_processing:
+                break
+
+            url = getattr(result, "url", None) or ""
+            if not url or url in scraped_urls or _should_skip(url):
+                continue
+
+            domain = urlparse(url).netloc.replace("www.", "")
+            try:
+                content = raw_scrape(url, max_chars=cfg.max_page_chars)
+            except Exception as exc:
+                console.print(f"  [dim]Scrape failed {domain}: {exc}[/]")
+                continue
+
+            if not content or len(content) < 100:
+                continue
+
+            scraped_urls.add(url)
+            total_sources += 1
+            session_domain_counts[domain] = session_domain_counts.get(domain, 0) + 1
+
+            chunks = _chunk_content(content)
+            point = _extract_best_point(chunks, section_title, domain, llm)
+            llm_calls += 1
+
+            if point:
+                points.append(f"[{domain}] {point}")
+                console.print(f"  [green]+[/] {domain}: {point[:80]}…" if len(point) > 80 else f"  [green]+[/] {domain}: {point}")
+
+                # Resynthesize every time we have a new point
+                section_text = _synthesize_section(section_title, points, llm)
+                llm_calls += 1
+
+                if section_text:
+                    save_section_content(node_id, section_text)
+                    total_words = sum(
+                        len((load_section_content(n["id"]) or "").split())
+                        for n in get_toc(doc_id)
+                        if n.get("status") in ("active", "complete")
+                    )
+                    _write_incremental_report(doc_id, query, state.get("document_title", ""), cfg)
+
+            # Check goal after each URL
+            if g.max_sources and total_sources >= g.max_sources:
+                stop_processing = True
+                break
+            if g.max_words and total_words >= g.max_words:
+                stop_processing = True
+                break
+
+        time.sleep(cfg.search_delay_seconds)
+
+    # Finalise section
+    final_content = load_section_content(node_id) or ""
+    if final_content:
+        summary = _generate_node_summary(section_title, final_content)
+        update_node_summary(node_id, summary)
+        update_node_status(node_id, "complete")
+        # Try to seed follow-up topics if we're in forever-mode
+        current_gen = state.get("query_generation", 0)
+        _seed_queries_from_content(doc_id, node_id, section_title, final_content, current_gen, llm)
+    else:
+        update_node_status(node_id, "complete")  # nothing found, move on
+
+    return {
+        "scraped_urls": scraped_urls,
+        "session_domain_counts": session_domain_counts,
+        "total_sources_scraped": total_sources,
+        "total_words_written": total_words,
+        "consecutive_empty_searches": consec_empty,
+        "llm_call_count": llm_calls,
+        "iteration": state.get("iteration", 0) + 1,
+        "status": f"Completed section: {section_title}",
+    }
+
 
 def check_completion_node(state: dict) -> dict:
-    """
-    Evaluate stopping conditions from ResearchGoal and set should_stop / stop_reason.
-    Also checks required_topics via tree_search if any are specified.
-    """
-    from datetime import datetime, timedelta
-
+    """Decide whether to stop or continue to the next section."""
     from mariana.utils.retrieval import check_required_topics
 
-    goal_config = state.get("goal_config") or {}
     doc_id = state.get("doc_id", "")
-
-    # Reconstruct limits from goal_config dict
-    max_runtime_sec = goal_config.get("max_runtime_seconds")
-    max_sources     = goal_config.get("max_sources")
-    target_words    = goal_config.get("target_words")
-    required_topics = goal_config.get("required_topics") or []
-    max_iterations  = goal_config.get("max_iterations")
-
-    started_at_str  = state.get("started_at", "")
-    iteration       = state.get("iteration", 0)
-    total_sources   = state.get("total_sources_scraped", 0)
-    total_words     = state.get("total_words_written", 0)
-    consec_empty    = state.get("consecutive_empty_searches", 0)
+    goal_cfg = state.get("goal_config", {})
+    g = ResearchGoal.from_dict(goal_cfg)
 
     reason = ""
 
-    # 1. Runtime check
-    if max_runtime_sec and started_at_str:
-        try:
-            started = datetime.fromisoformat(started_at_str)
-            elapsed = (datetime.now() - started).total_seconds()
-            if elapsed >= max_runtime_sec:
-                reason = f"runtime limit reached ({elapsed:.0f}s / {max_runtime_sec:.0f}s)"
-        except ValueError:
-            pass
+    # 1. Goal: all sections processed
+    pending = get_pending_sections(doc_id)
+    if not pending:
+        reason = "All sections completed"
 
-    # 2. Source count check
-    if not reason and max_sources and total_sources >= max_sources:
-        reason = f"source limit reached ({total_sources}/{max_sources})"
+    # 2. Goal: max sources
+    if not reason and g.max_sources:
+        if state.get("total_sources_scraped", 0) >= g.max_sources:
+            reason = f"Reached max sources ({g.max_sources})"
 
-    # 3. Word count target
-    if not reason and target_words and total_words >= target_words:
-        reason = f"word target reached ({total_words}/{target_words})"
+    # 3. Goal: max words
+    if not reason and g.max_words:
+        if state.get("total_words_written", 0) >= g.max_words:
+            reason = f"Reached max words ({g.max_words})"
 
-    # 4. Iteration ceiling
-    if not reason and max_iterations and iteration >= max_iterations:
-        reason = f"iteration limit reached ({iteration}/{max_iterations})"
+    # 4. Goal: max duration
+    if not reason and g.max_duration_seconds:
+        started = state.get("started_at", "")
+        if started:
+            from datetime import datetime
+            elapsed = (datetime.now() - datetime.fromisoformat(started)).total_seconds()
+            if elapsed >= g.max_duration_seconds:
+                reason = f"Reached time limit ({g.max_duration_seconds}s)"
 
-    # 5. Required topics
-    if not reason and required_topics and doc_id:
-        llm = get_planner_llm()
-        unanswered = check_required_topics(doc_id, required_topics, llm)
-        if not unanswered:
-            reason = "all required topics covered"
-        else:
-            console.print(
-                f"[blue]Required topics outstanding:[/] {', '.join(unanswered)}"
-            )
+    # 5. Goal: required topics covered
+    if not reason and g.require_topics:
+        toc = get_toc(doc_id) if doc_id else []
+        completed_titles = [n["title"] for n in toc if n.get("status") == "complete"]
+        if completed_titles:
+            missing = check_required_topics(g.require_topics, completed_titles)
+            if missing:
+                console.print(f"[dim]Still need: {missing}[/]")
+            # Don't stop just for this — let section loop handle it
 
     # 6. Consecutive empty searches safety valve
-    if not reason and consec_empty >= 5:
+    if not reason and state.get("consecutive_empty_searches", 0) >= 5:
         reason = "5 consecutive searches returned no usable content"
 
     if reason:
@@ -864,3 +546,65 @@ def check_completion_node(state: dict) -> dict:
         "status": f"Completion check: {'stop' if reason else 'continue'}",
     }
 
+
+def finalize_node(state: dict) -> dict:
+    """Write the final Markdown report from all completed sections."""
+    cfg = load_config()
+    doc_id = state.get("doc_id", "")
+    query = state.get("query", "")
+    document_title = state.get("document_title", query.title())
+
+    toc = get_toc(doc_id) if doc_id else []
+    completed = [n for n in toc if n["status"] == "complete" and n["depth"] == 0]
+
+    if not completed:
+        console.print("[yellow]No completed sections — nothing to write.[/]")
+        return {"status": "No content to write"}
+
+    # Build sections text for exec summary
+    sections_for_summary: list[str] = []
+    for node in sorted(completed, key=lambda n: n["order_index"]):
+        content = load_section_content(node["id"]) or ""
+        if content:
+            sections_for_summary.append(f"## {node['title']}\n{content}")
+
+    section_texts = "\n\n".join(sections_for_summary)
+
+    exec_summary = _llm_exec_summary(query, section_texts)
+    conclusion = _llm_conclusion(query, section_texts)
+
+    # Assemble full report
+    lines = [f"# {document_title}\n"]
+    if exec_summary:
+        lines.append("## Summary\n")
+        lines.append(exec_summary)
+        lines.append("")
+    for text in sections_for_summary:
+        lines.append(text)
+        lines.append("")
+    if conclusion:
+        lines.append("## Conclusion\n")
+        lines.append(conclusion)
+        lines.append("")
+
+    report = "\n".join(lines)
+    output_dir = ensure_output_dir(cfg)
+    safe_title = re.sub(r"[^\w\s-]", "", document_title.lower())
+    safe_title = re.sub(r"[\s]+", "_", safe_title)[:60]
+    report_path = output_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_title}.md"
+    report_path.write_text(report, encoding="utf-8")
+
+    # Remove partial file
+    partial = output_dir / f"{doc_id[:8]}_partial.md"
+    if partial.exists():
+        partial.unlink()
+
+    word_count = len(report.split())
+    console.print(f"[bold green]Report written:[/] {report_path} ({word_count} words)")
+
+    return {
+        "final_report": str(report_path),
+        "total_words_written": word_count,
+        "llm_call_count": state.get("llm_call_count", 0) + 2,
+        "status": "Report complete",
+    }

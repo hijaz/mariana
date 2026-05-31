@@ -36,7 +36,8 @@ class MarianaConfig(BaseSettings):
     min_sections: int = 3
     max_sections: int = 4
     max_page_chars: int = 20000
-    search_delay_seconds: float = 2.0
+    search_delay_seconds: float = 1.0
+    max_section_words: int = 600
     output_dir: Path = RUNTIME_DIR / "output"
 
     @field_validator("output_dir", mode="before")

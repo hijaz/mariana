@@ -3,7 +3,6 @@ import hashlib
 import re
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 import click
 from rich.console import Console
@@ -12,20 +11,20 @@ from rich.panel import Panel
 from rich.table import Table
 
 from mariana.graph import get_graph
-from mariana.state import ResearchGoal, SubQuestion, initial_state
+from mariana.state import ResearchGoal, initial_state
 from mariana.utils.config import load_config, save_setting
 from mariana.utils.llm import check_ollama, get_planner_llm, get_summarizer_llm
 from mariana.utils.searxng import SearXNGManager
 from mariana.utils.tracing import write_trace
 
 NODE_LABELS = {
-    "plan":      "Orchestrating outline",
-    "search":    "Searching & scraping",
-    "summarize": "Summarizing sources",
-    "save":      "Saving to store",
-    "reflect":   "Reflecting on coverage",
-    "check":     "Checking completion",
-    "report":    "Writing report",
+    "init_document":    "Initialising document",
+    "plan_toc":         "Planning table of contents",
+    "select_section":   "Selecting next section",
+    "generate_queries": "Generating search queries",
+    "process_section":  "Researching section",
+    "check_completion": "Checking completion",
+    "finalize":         "Writing final report",
 }
 
 console = Console()
@@ -83,37 +82,25 @@ def _query_thread_id(query: str) -> str:
     return hashlib.md5(query.strip().lower().encode()).hexdigest()[:16]
 
 
-_HIGH_QUALITY_DOMAINS = {
-    "wikipedia.org", "iaea.org", "energy.gov", "iter.org",
-    "nature.com", "science.org", "aps.org", "nasa.gov",
-    "pubmed.ncbi.nlm.nih.gov", "arxiv.org", "doi.org",
-    "scholar.google.com", "britannica.com", "nist.gov",
-}
-
-
 def _print_session_summary(state: dict, elapsed: float, report_path: Path | None = None) -> None:
-    sub_questions = state.get("sub_questions", [])
-    answered = [sq for sq in sub_questions if isinstance(sq, SubQuestion) and sq.answered]
-    total_sources = sum(len(sq.results) for sq in sub_questions if isinstance(sq, SubQuestion))
-    usable_sources = sum(
-        len([r for r in sq.results if len(r.content or "") > 200])
-        for sq in sub_questions if isinstance(sq, SubQuestion)
-    )
-    all_results = [
-        r for sq in sub_questions if isinstance(sq, SubQuestion) for r in sq.results
-    ]
-    domains = {urlparse(r.url).netloc.replace("www.", "") for r in all_results}
-    authority_count = sum(
-        1 for r in all_results
-        if any(hq in r.url for hq in _HIGH_QUALITY_DOMAINS)
-    )
+    from mariana.utils.store import get_toc
+    doc_id = state.get("doc_id", "")
+    total_sources = state.get("total_sources_scraped", 0)
+    total_words = state.get("total_words_written", 0)
     llm_calls = state.get("llm_call_count", 0)
 
+    sections: list[dict] = []
+    if doc_id:
+        try:
+            toc = get_toc(doc_id)
+            sections = [n for n in toc if n.get("status") == "complete"]
+        except Exception:
+            pass
+
     table = Table(show_header=False, box=None, padding=(0, 2))
-    table.add_row("Sections completed", f"{len(answered)} / {len(sub_questions)}")
-    table.add_row("Sources scraped", f"{total_sources} ({usable_sources} usable)")
-    table.add_row("Unique domains", str(len(domains)))
-    table.add_row("Authority sources", str(authority_count))
+    table.add_row("Sections completed", str(len(sections)))
+    table.add_row("Sources scraped", str(total_sources))
+    table.add_row("Words written", str(total_words))
     table.add_row("LLM calls", str(llm_calls))
     table.add_row("Total time", f"{elapsed:.0f}s")
     if state.get("stop_reason"):
