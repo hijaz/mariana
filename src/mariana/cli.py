@@ -9,7 +9,6 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 
-from mariana.graph import get_graph
 from mariana.state import ResearchGoal, initial_state
 from mariana.utils.config import load_config, save_setting
 from mariana.utils.llm import check_ollama, get_planner_llm, get_summarizer_llm
@@ -104,6 +103,54 @@ def _print_session_summary(state: dict, elapsed: float, report_path: Path | None
     console.print(Panel(table, title="Session Summary", border_style="dim"))
 
 
+def _step(label: str, fn, state: dict, start: float) -> dict:
+    """Call a node function, log entry/exit with timing, merge result into state."""
+    t0 = time.time()
+    console.print(f"  [dim]{t0 - start:5.1f}s[/]  [bold cyan]{label}[/]  …")
+    try:
+        result = fn(state)
+    except Exception as exc:
+        console.print(f"  [red]ERROR in {label}:[/] {exc}")
+        raise
+    state = {**state, **result}
+    t1 = time.time()
+    status = result.get("status", "")
+    console.print(f"  [dim]{t1 - start:5.1f}s[/]  [bold cyan]{label}[/]  [green]done[/]  {status}")
+    return state
+
+
+def _run_pipeline(state: dict, start: float) -> dict:
+    """
+    Execute the research pipeline as a plain Python loop.
+    Identical logic to the LangGraph topology but with zero framework overhead.
+    """
+    from mariana.nodes import (
+        check_completion_node,
+        finalize_node,
+        generate_queries_node,
+        init_document_node,
+        plan_toc_node,
+        process_section_node,
+        select_section_node,
+    )
+
+    state = _step(NODE_LABELS["init_document"],    init_document_node,    state, start)
+    state = _step(NODE_LABELS["plan_toc"],         plan_toc_node,         state, start)
+
+    while True:
+        state = _step(NODE_LABELS["select_section"],   select_section_node,   state, start)
+        if state.get("should_stop"):
+            break
+        state = _step(NODE_LABELS["generate_queries"], generate_queries_node, state, start)
+        state = _step(NODE_LABELS["process_section"],  process_section_node,  state, start)
+        state = _step(NODE_LABELS["check_completion"], check_completion_node, state, start)
+        if state.get("should_stop"):
+            break
+
+    state = _step(NODE_LABELS["finalize"], finalize_node, state, start)
+    return state
+
+
 def _run_query(query: str, cfg, goal: ResearchGoal | None = None):
     console.print(Panel(f"[blue]Research started:[/] {query}", title="Mariana"))
     g = goal or ResearchGoal.from_cli()
@@ -120,10 +167,7 @@ def _run_query(query: str, cfg, goal: ResearchGoal | None = None):
         console.print(f"[white]Max sources:[/] {g.max_sources}")
     start = time.time()
 
-    graph = get_graph()
-    final_state: dict = {}
-
-    final_state = graph.invoke(initial_state(query, goal=g))
+    final_state = _run_pipeline(initial_state(query, goal=g), start)
 
     elapsed = time.time() - start
     report = final_state.get("final_report", "")
@@ -131,12 +175,9 @@ def _run_query(query: str, cfg, goal: ResearchGoal | None = None):
         console.print(Panel("[red]No report was generated.", title="Error"))
         raise SystemExit(1)
 
-    # Extract report path from status message
-    status_msg = final_state.get("status", "")
     report_path: Path | None = None
-    path_match = re.search(r"Report saved to (.+)", status_msg)
-    if path_match:
-        report_path = Path(path_match.group(1).strip())
+    if report and Path(report).exists():
+        report_path = Path(report)
 
     # Write trace file
     try:
@@ -146,7 +187,8 @@ def _run_query(query: str, cfg, goal: ResearchGoal | None = None):
         pass
 
     _print_session_summary(final_state, elapsed, report_path)
-    console.print(Markdown(report))
+    console.print(Markdown(final_state.get("final_report", "")))
+
 
 
 @click.group()
