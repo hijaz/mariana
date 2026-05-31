@@ -398,12 +398,13 @@ def process_section_node(state: dict) -> dict:
             break
 
         try:
-            raw_results = raw_search(search_query)
+            raw_results = raw_search(search_query, cfg.searxng_port, cfg.max_results)
         except Exception as exc:
             console.print(f"  [yellow]Search error:[/] {exc}")
             raw_results = []
 
-        diverse_results = filter_for_diversity(raw_results, session_domain_counts, cfg=cfg)
+        section_domain_counts: dict = {}
+        diverse_results = filter_for_diversity(raw_results, section_domain_counts, session_domain_counts)
 
         if not diverse_results:
             consec_empty += 1
@@ -414,7 +415,7 @@ def process_section_node(state: dict) -> dict:
             if stop_processing:
                 break
 
-            url = getattr(result, "url", None) or ""
+            url = result.get("url") if isinstance(result, dict) else (getattr(result, "url", None) or "")
             if not url or url in scraped_urls or _should_skip(url):
                 continue
 

@@ -1,5 +1,4 @@
 import atexit
-import hashlib
 import re
 import time
 from pathlib import Path
@@ -77,11 +76,6 @@ def _preflight(model=None, iterations=None):
     return cfg, manager
 
 
-def _query_thread_id(query: str) -> str:
-    """Stable thread ID derived from the query for LangGraph checkpointing."""
-    return hashlib.md5(query.strip().lower().encode()).hexdigest()[:16]
-
-
 def _print_session_summary(state: dict, elapsed: float, report_path: Path | None = None) -> None:
     from mariana.utils.store import get_toc
     doc_id = state.get("doc_id", "")
@@ -110,7 +104,7 @@ def _print_session_summary(state: dict, elapsed: float, report_path: Path | None
     console.print(Panel(table, title="Session Summary", border_style="dim"))
 
 
-def _run_query(query: str, cfg, fresh: bool = False, goal: ResearchGoal | None = None):
+def _run_query(query: str, cfg, goal: ResearchGoal | None = None):
     console.print(Panel(f"[blue]Research started:[/] {query}", title="Mariana"))
     g = goal or ResearchGoal.from_cli()
     console.print(f"[white]Iterations:[/] {g.max_iterations}  "
@@ -126,28 +120,10 @@ def _run_query(query: str, cfg, fresh: bool = False, goal: ResearchGoal | None =
         console.print(f"[white]Max sources:[/] {g.max_sources}")
     start = time.time()
 
-    thread_id = _query_thread_id(query)
-    run_config = {"configurable": {"thread_id": thread_id}}
-    if fresh:
-        console.print(f"[dim]--fresh: new thread {thread_id}[/]")
-        run_config["configurable"]["thread_id"] = thread_id + "_" + str(int(time.time()))
-
     graph = get_graph()
     final_state: dict = {}
 
-    try:
-        for event in graph.stream(initial_state(query, goal=g), config=run_config, stream_mode="updates"):
-            for node_name, node_output in event.items():
-                label = NODE_LABELS.get(node_name, node_name)
-                node_status = node_output.get("status", "")
-                elapsed_so_far = time.time() - start
-                console.print(
-                    f"  [dim]{elapsed_so_far:5.1f}s[/]  [bold cyan]{label}[/]  {node_status}"
-                )
-                final_state.update(node_output)
-    except TypeError:
-        # Checkpointer not available — fall back to invoke without config
-        final_state = graph.invoke(initial_state(query))
+    final_state = graph.invoke(initial_state(query, goal=g))
 
     elapsed = time.time() - start
     report = final_state.get("final_report", "")
@@ -183,7 +159,6 @@ def cli():
 @click.argument("query")
 @click.option("--model", default=None, help="Override Ollama model")
 @click.option("--iterations", default=None, type=int, help="Max research iterations")
-@click.option("--fresh", is_flag=True, default=False, help="Ignore saved checkpoint and start fresh")
 @click.option("--for", "duration", default=None,
               help="Run until time limit, e.g. 30m, 2h, 1h30m")
 @click.option("--sources", default=None, type=int,
@@ -192,7 +167,7 @@ def cli():
               help="Stop after writing this many words")
 @click.option("--require", multiple=True,
               help="Required topic(s) to cover before stopping (can repeat)")
-def research(query, model, iterations, fresh, duration, sources, words, require):
+def research(query, model, iterations, duration, sources, words, require):
     "Run deep research on a question and save a Markdown report."
     cfg, _ = _preflight(model=model, iterations=iterations)
     goal = ResearchGoal.from_cli(
@@ -202,7 +177,7 @@ def research(query, model, iterations, fresh, duration, sources, words, require)
         max_iterations=iterations,
         required_topics=require,
     )
-    _run_query(query, cfg, fresh=fresh, goal=goal)
+    _run_query(query, cfg, goal=goal)
 
 
 @cli.command()

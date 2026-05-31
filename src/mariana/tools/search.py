@@ -209,7 +209,9 @@ def _do_scrape(url: str, max_chars: int) -> str:
     # Tier 2: readability-lxml fallback
     try:
         resp = httpx.get(url, headers=_HEADERS, timeout=12.0, follow_redirects=True)
-        doc = Document(resp.text)
+        # Strip null bytes and XML-incompatible control characters before parsing
+        safe_html = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', resp.text)
+        doc = Document(safe_html)
         text = markdownify(doc.summary(), strip=["a", "img"])
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
         if len(text) > 200:

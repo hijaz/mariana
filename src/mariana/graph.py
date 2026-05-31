@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from langgraph.graph import END, START, StateGraph
 
 from mariana.nodes import (
@@ -13,7 +11,7 @@ from mariana.nodes import (
 )
 from mariana.state import ResearchState
 
-_CHECKPOINT_DIR = Path.home() / ".mariana" / "checkpoints"
+_graph = None
 
 
 def route_after_check(state: dict) -> str:
@@ -22,7 +20,7 @@ def route_after_check(state: dict) -> str:
     return "select_section"
 
 
-def build_graph(checkpointer=None):
+def build_graph():
     builder = StateGraph(ResearchState)
     builder.add_node("init_document",    init_document_node)
     builder.add_node("plan_toc",         plan_toc_node)
@@ -45,20 +43,11 @@ def build_graph(checkpointer=None):
         route_after_check,
         {"select_section": "select_section", "finalize": "finalize"},
     )
-    return builder.compile(checkpointer=checkpointer)
+    return builder.compile()
 
 
-def get_graph(use_checkpointing: bool = True):
-    """Return a compiled graph, optionally with SQLite checkpointing."""
-    if not use_checkpointing:
-        return build_graph()
-
-    try:
-        from langgraph.checkpoint.sqlite import SqliteSaver
-
-        _CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-        db_path = str(_CHECKPOINT_DIR / "mariana.db")
-        checkpointer = SqliteSaver.from_conn_string(db_path)
-        return build_graph(checkpointer=checkpointer)
-    except Exception:
-        return build_graph()
+def get_graph():
+    global _graph
+    if _graph is None:
+        _graph = build_graph()
+    return _graph
