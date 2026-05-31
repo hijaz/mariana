@@ -1,6 +1,6 @@
-from mariana.utils.llm import SimplePrompt
+from langchain_core.prompts import ChatPromptTemplate
 
-PLANNER_PROMPT = SimplePrompt([
+PLANNER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You are a research planning assistant. Break the research question into"
      " {num_questions} specific, focused, non-overlapping sub-questions that"
@@ -13,7 +13,7 @@ PLANNER_PROMPT = SimplePrompt([
      "Known gaps to address: {gaps}"),
 ])
 
-DISTILL_PROMPT = SimplePrompt([
+DISTILL_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "Convert the research question into a short web search query.\n"
      "RULES:\n"
@@ -26,7 +26,7 @@ DISTILL_PROMPT = SimplePrompt([
     ("human", "Research question: {question}"),
 ])
 
-EXTRACT_PROMPT = SimplePrompt([
+EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "Read the source and extract the single most relevant fact or "
      "insight that relates to the section topic. "
@@ -37,7 +37,7 @@ EXTRACT_PROMPT = SimplePrompt([
      "Source ({domain}):\n{content}"),
 ])
 
-SYNTHESIZE_PROMPT = SimplePrompt([
+SYNTHESIZE_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "Write a research section in 3-6 sentences. "
      "Incorporate all provided findings naturally into flowing prose. "
@@ -48,7 +48,7 @@ SYNTHESIZE_PROMPT = SimplePrompt([
      "Research findings:\n{points}"),
 ])
 
-SECTION_PROMPT = SimplePrompt([
+SECTION_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You are a technical writer. Write one focused Markdown section (150-250 words)"
      " that answers the research question below. Use only the provided summary."
@@ -59,7 +59,7 @@ SECTION_PROMPT = SimplePrompt([
      "Section:"),
 ])
 
-EXEC_SUMMARY_PROMPT = SimplePrompt([
+EXEC_SUMMARY_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You are a research writer. Write a 2-3 sentence executive summary for a"
      " research report. The summary must cover the most important findings only."
@@ -70,7 +70,7 @@ EXEC_SUMMARY_PROMPT = SimplePrompt([
      "Executive summary:"),
 ])
 
-CONCLUSION_PROMPT = SimplePrompt([
+CONCLUSION_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "Write a 2-3 sentence conclusion for a research report. "
      "Synthesize the key takeaways. Be specific. "
@@ -79,7 +79,7 @@ CONCLUSION_PROMPT = SimplePrompt([
     ("human", "Topic: {query}\n\nFindings summary:\n{findings}"),
 ])
 
-SUMMARIZE_NODE_PROMPT = SimplePrompt([
+SUMMARIZE_NODE_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "Write a single sentence (max 20 words) summarising the KEY FINDING "
      "in the text below. Be specific — include a concrete fact, number, or "
@@ -89,7 +89,7 @@ SUMMARIZE_NODE_PROMPT = SimplePrompt([
      "Text:\n{text}"),
 ])
 
-QUERY_GENERATOR_PROMPT = SimplePrompt([
+QUERY_GENERATOR_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "Generate exactly {n} search queries to research the given topic.\n"
      "Rules:\n"
@@ -107,7 +107,7 @@ QUERY_GENERATOR_PROMPT = SimplePrompt([
     ("human", "Topic: {query}"),
 ])
 
-REPORT_PROMPT = SimplePrompt([
+REPORT_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You are an expert research writer. Write a clear, well-structured report in Markdown.\n"
      "Use this structure:\n"
@@ -124,7 +124,7 @@ REPORT_PROMPT = SimplePrompt([
      "Write the full report now."),
 ])
 
-TOC_PLANNER_PROMPT = SimplePrompt([
+TOC_PLANNER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You are planning the table of contents for a research report.\n"
      "Generate exactly {n} section titles.\n"
@@ -142,7 +142,7 @@ TOC_PLANNER_PROMPT = SimplePrompt([
     ("human", "Research topic: {query}"),
 ])
 
-FOLLOW_UP_PROMPT = SimplePrompt([
+FOLLOW_UP_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "Based on the completed research section, suggest 1-2 related sub-topics "
      "worth investigating further.\n"

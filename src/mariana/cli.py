@@ -6,10 +6,15 @@ import time
 from pathlib import Path
 
 import click
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
+
+# Load .env before any other mariana imports so LANGCHAIN_* vars are present
+# when LangSmith instruments the LangGraph/ChatOllama calls.
+load_dotenv()
 
 from mariana.state import ResearchGoal, initial_state
 from mariana.utils.config import load_config, save_setting
@@ -135,35 +140,21 @@ def _step(label: str, fn, state: dict, start: float) -> dict:
 
 
 def _run_pipeline(state: dict, start: float) -> dict:
-    """
-    Execute the research pipeline as a plain Python loop.
-    Identical logic to the LangGraph topology but with zero framework overhead.
-    """
-    from mariana.nodes import (
-        check_completion_node,
-        finalize_node,
-        generate_queries_node,
-        init_document_node,
-        plan_toc_node,
-        process_section_node,
-        select_section_node,
-    )
+    """Execute the research pipeline using the LangGraph StateGraph."""
+    from mariana.graph import get_graph
 
-    state = _step(NODE_LABELS["init_document"],    init_document_node,    state, start)
-    state = _step(NODE_LABELS["plan_toc"],         plan_toc_node,         state, start)
-
-    while True:
-        state = _step(NODE_LABELS["select_section"],   select_section_node,   state, start)
-        if state.get("should_stop"):
-            break
-        state = _step(NODE_LABELS["generate_queries"], generate_queries_node, state, start)
-        state = _step(NODE_LABELS["process_section"],  process_section_node,  state, start)
-        state = _step(NODE_LABELS["check_completion"], check_completion_node, state, start)
-        if state.get("should_stop"):
-            break
-
-    state = _step(NODE_LABELS["finalize"], finalize_node, state, start)
-    return state
+    graph = get_graph()
+    final_state = state
+    for chunk in graph.stream(state, stream_mode="updates"):
+        for node_name, update in chunk.items():
+            label = NODE_LABELS.get(node_name, node_name)
+            final_state = {**final_state, **update}
+            elapsed = time.time() - start
+            status = update.get("status", "")
+            console.print(
+                f"  [dim]{elapsed:5.1f}s  {_rss_mb():4d}MB[/]  [bold cyan]{label}[/]  [green]done[/]  {status}"
+            )
+    return final_state
 
 
 def _run_query(query: str, cfg, goal: ResearchGoal | None = None):

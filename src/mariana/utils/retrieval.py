@@ -4,14 +4,14 @@ Each call is cheap: reads 3-4 section summaries and lets the LLM navigate by rea
 """
 import re
 
-from mariana.utils.llm import SimplePrompt
+from langchain_core.prompts import ChatPromptTemplate
 from rich.console import Console
 
 from mariana.utils.store import get_db, load_section_content
 
 console = Console()
 
-TREE_SEARCH_PROMPT = SimplePrompt([
+TREE_SEARCH_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You are navigating a research document to find sections relevant "
      "to a query. Read the section summaries and select which ones "
@@ -24,7 +24,7 @@ TREE_SEARCH_PROMPT = SimplePrompt([
      "Sections:\n{summaries}"),
 ])
 
-TOPIC_CHECK_PROMPT = SimplePrompt([
+TOPIC_CHECK_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "Does the provided text answer the question? "
      "Reply with exactly one word: YES or NO."),

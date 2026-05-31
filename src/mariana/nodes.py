@@ -126,7 +126,7 @@ def _extract_best_point(chunks: list[str], section_title: str, domain: str, llm)
         result = (EXTRACT_PROMPT | llm).invoke({
             "section_title": section_title,
             "domain": domain,
-            "content": chunk,
+            "content": chunk.replace("{", "{{").replace("}", "}}"),
         })
         point = (getattr(result, "content", None) or "").strip()
         if point and "NOT RELEVANT" not in point.upper() and len(point) > 15:

@@ -14,6 +14,12 @@ from mariana.state import ResearchState
 _graph = None
 
 
+def route_after_select(state: dict) -> str:
+    if state.get("should_stop"):
+        return "finalize"
+    return "generate_queries"
+
+
 def route_after_check(state: dict) -> str:
     if state.get("should_stop"):
         return "finalize"
@@ -33,7 +39,11 @@ def build_graph():
     builder.add_edge(START,               "init_document")
     builder.add_edge("init_document",     "plan_toc")
     builder.add_edge("plan_toc",          "select_section")
-    builder.add_edge("select_section",    "generate_queries")
+    builder.add_conditional_edges(
+        "select_section",
+        route_after_select,
+        {"generate_queries": "generate_queries", "finalize": "finalize"},
+    )
     builder.add_edge("generate_queries",  "process_section")
     builder.add_edge("process_section",   "check_completion")
     builder.add_edge("finalize",          END)
