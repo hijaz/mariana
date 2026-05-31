@@ -1,5 +1,6 @@
 """Lightweight Ollama client — no langchain_ollama, no heavy ML imports."""
 from functools import lru_cache
+from pathlib import Path
 
 import httpx
 from rich.console import Console
@@ -8,6 +9,27 @@ from mariana.utils.config import load_config
 
 MAX_LLM_INPUT_CHARS = 2000
 console = Console()
+
+
+def _log_mem_pressure() -> None:
+    """Print available system memory so OOM pressure is visible in logs."""
+    try:
+        meminfo = Path("/proc/meminfo").read_text()
+        avail = next(
+            int(line.split()[1])
+            for line in meminfo.splitlines()
+            if line.startswith("MemAvailable:")
+        )
+        swap_free = next(
+            (int(line.split()[1]) for line in meminfo.splitlines() if line.startswith("SwapFree:")),
+            0,
+        )
+        avail_mb = avail // 1024
+        swap_mb = swap_free // 1024
+        level = "red" if avail_mb < 512 else "yellow" if avail_mb < 1024 else "dim"
+        console.print(f"  [{level}]sys mem: {avail_mb} MB RAM free, {swap_mb} MB swap free[/]")
+    except Exception:
+        pass
 
 
 def _msg_role(msg) -> str:
@@ -55,9 +77,13 @@ class SimplePrompt:
         self._messages = messages
 
     def format_messages(self, **kwargs) -> list[_SimpleMessage]:
+        # Escape braces in VALUES so scraped text with {foo} doesn't crash format_map.
+        # Template placeholders like {section_title} still resolve correctly because
+        # format_map sees the escaped values as literal text after substitution.
+        safe = {k: str(v).replace("{", "{{").replace("}", "}}") for k, v in kwargs.items()}
         result = []
         for role, template in self._messages:
-            content = template.format_map(kwargs)
+            content = template.format_map(safe)
             result.append(_SimpleMessage(role, content))
         return result
 
@@ -88,11 +114,12 @@ class OllamaLLM:
     continues to work unchanged.
     """
 
-    def __init__(self, model: str, base_url: str, temperature: float, num_predict: int):
+    def __init__(self, model: str, base_url: str, temperature: float, num_predict: int, num_ctx: int | None = None):
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.temperature = temperature
         self.num_predict = num_predict
+        self.num_ctx = num_ctx  # None = use Ollama/model default
 
     # Support: prompt | llm  (langchain_core wraps callables in RunnableLambda)
     def __call__(self, input) -> _Response:
@@ -103,18 +130,22 @@ class OllamaLLM:
         return _Chain(prompt, self)
 
     def _call(self, messages: list[dict]) -> _Response:
+        _log_mem_pressure()
+        options: dict = {
+            "temperature": self.temperature,
+            "num_predict": self.num_predict,
+        }
+        if self.num_ctx is not None:
+            options["num_ctx"] = self.num_ctx
         resp = httpx.post(
             f"{self.base_url}/api/chat",
             json={
                 "model": self.model,
                 "messages": messages,
                 "stream": False,
-                "options": {
-                    "temperature": self.temperature,
-                    "num_predict": self.num_predict,
-                },
+                "options": options,
             },
-            timeout=120.0,
+            timeout=300.0,
         )
         resp.raise_for_status()
         content = resp.json().get("message", {}).get("content", "")
@@ -137,25 +168,30 @@ class OllamaLLM:
 
 
 @lru_cache(maxsize=1)
-def get_planner_llm() -> OllamaLLM:
+def get_llm() -> OllamaLLM:
+    """Single shared LLM instance — one Ollama session, no session switching."""
     cfg = load_config()
     return OllamaLLM(
         model=cfg.planner_model,
         base_url=cfg.ollama_base_url,
-        temperature=0.4,
-        num_predict=1024,
+        temperature=0.3,
+        num_predict=512,  # all our prompts need ≤200 tokens; 512 gives headroom
+        num_ctx=2048,     # explicit: prevents Ollama allocating O(n²) buffers for n=32768
+        # Gemma 3 global-attention layers allocate 32768²×heads×2B ≈ 12 GB at the
+        # model-default context length; 2048 context costs ~100 MB total.
+        # All prompts fit: MAX_LLM_INPUT_CHARS=2000 (~500 tokens) + overhead ≈ 600
+        # tokens in, 512 tokens out → 1112 total, well within the 2048 window.
     )
 
 
-@lru_cache(maxsize=1)
+def get_planner_llm() -> OllamaLLM:
+    """Alias for get_llm() — kept for call-site compatibility."""
+    return get_llm()
+
+
 def get_summarizer_llm() -> OllamaLLM:
-    cfg = load_config()
-    return OllamaLLM(
-        model=cfg.summarizer_model,
-        base_url=cfg.ollama_base_url,
-        temperature=0.1,
-        num_predict=2048,
-    )
+    """Alias for get_llm() — kept for call-site compatibility."""
+    return get_llm()
 
 
 def truncate_for_llm(text: str, label: str = "input") -> str:

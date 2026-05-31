@@ -1,6 +1,7 @@
 import atexit
 import os
 import re
+import resource
 import time
 from pathlib import Path
 
@@ -12,15 +13,23 @@ from rich.table import Table
 
 from mariana.state import ResearchGoal, initial_state
 from mariana.utils.config import load_config, save_setting
-from mariana.utils.llm import check_ollama, get_planner_llm, get_summarizer_llm
+from mariana.utils.llm import check_ollama, get_llm, get_planner_llm, get_summarizer_llm
 from mariana.utils.searxng import SearXNGManager
 from mariana.utils.tracing import write_trace
 
 # Ask the Linux OOM killer to spare our process — prefer killing other things first.
+# Writing a negative value requires CAP_SYS_RESOURCE; we attempt it and log the result.
+_oom_adj_path = Path(f"/proc/{os.getpid()}/oom_score_adj")
 try:
-    Path(f"/proc/{os.getpid()}/oom_score_adj").write_text("-200")
+    _oom_adj_path.write_text("-200")
 except OSError:
+    # Unprivileged users can only raise (not lower) oom_score_adj.
+    # Write 0 explicitly to ensure default, then note it in startup.
     pass
+
+
+def _rss_mb() -> int:
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
 
 NODE_LABELS = {
     "init_document":    "Initialising document",
@@ -44,8 +53,7 @@ def _apply_overrides(cfg, model, iterations):
     if model:
         cfg.planner_model = model
         cfg.summarizer_model = model
-        get_planner_llm.cache_clear()
-        get_summarizer_llm.cache_clear()
+        get_llm.cache_clear()
     if iterations is not None:
         cfg.max_iterations = iterations
 
@@ -111,18 +119,18 @@ def _print_session_summary(state: dict, elapsed: float, report_path: Path | None
 
 
 def _step(label: str, fn, state: dict, start: float) -> dict:
-    """Call a node function, log entry/exit with timing, merge result into state."""
+    """Call a node function, log entry/exit with timing and RSS, merge result into state."""
     t0 = time.time()
-    console.print(f"  [dim]{t0 - start:5.1f}s[/]  [bold cyan]{label}[/]  …")
+    console.print(f"  [dim]{t0 - start:5.1f}s  {_rss_mb():4d}MB[/]  [bold cyan]{label}[/]  …")
     try:
         result = fn(state)
     except Exception as exc:
-        console.print(f"  [red]ERROR in {label}:[/] {exc}")
+        console.print(f"  [red]ERROR in {label}:[/] {exc}  (RSS {_rss_mb()} MB)")
         raise
     state = {**state, **result}
     t1 = time.time()
     status = result.get("status", "")
-    console.print(f"  [dim]{t1 - start:5.1f}s[/]  [bold cyan]{label}[/]  [green]done[/]  {status}")
+    console.print(f"  [dim]{t1 - start:5.1f}s  {_rss_mb():4d}MB[/]  [bold cyan]{label}[/]  [green]done[/]  {status}")
     return state
 
 

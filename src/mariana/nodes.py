@@ -96,6 +96,8 @@ def _chunk_content(text: str) -> list[str]:
             if last_period > start + int(CHUNK_SIZE * 0.6):
                 end = last_period + 1
         chunks.append(text[start:end])
+        if end >= len(text):
+            break  # reached the end — do not subtract overlap or we loop forever
         start = end - CHUNK_OVERLAP
     return chunks
 
@@ -378,21 +380,23 @@ def process_section_node(state: dict) -> dict:
     goal_met = g.max_sources and total_sources >= g.max_sources
     stop_processing = False
 
-    for search_query in queries:
+    for qi, search_query in enumerate(queries, 1):
         if stop_processing:
             break
         if goal_met:
             stop_processing = True
             break
 
+        console.print(f"  [dim]  query {qi}/{len(queries)}:[/] {search_query}")
         try:
             raw_results = raw_search(search_query, cfg.searxng_port, cfg.max_results)
         except Exception as exc:
-            console.print(f"  [yellow]Search error:[/] {exc}")
+            console.print(f"  [yellow]  search error:[/] {exc}")
             raw_results = []
 
         section_domain_counts: dict = {}
         diverse_results = filter_for_diversity(raw_results, section_domain_counts, session_domain_counts)
+        console.print(f"  [dim]  {len(raw_results)} results → {len(diverse_results)} after diversity filter[/]")
 
         if not diverse_results:
             consec_empty += 1
@@ -408,18 +412,21 @@ def process_section_node(state: dict) -> dict:
                 continue
 
             domain = urlparse(url).netloc.replace("www.", "")
+            console.print(f"  [dim]  scraping {domain} …[/]")
             try:
                 content = raw_scrape(url, max_chars=cfg.max_page_chars)
             except Exception as exc:
-                console.print(f"  [dim]Scrape failed {domain}: {exc}[/]")
+                console.print(f"  [dim]  scrape failed {domain}: {exc}[/]")
                 continue
 
             if not content or len(content) < 100:
+                console.print(f"  [dim]  {domain}: empty/too short, skipping[/]")
                 continue
 
             scraped_urls.add(url)
             total_sources += 1
             session_domain_counts[domain] = session_domain_counts.get(domain, 0) + 1
+            console.print(f"  [dim]  {domain}: {len(content)} chars → extracting point (LLM #{llm_calls+1}) …[/]")
 
             chunks = _chunk_content(content)
             point = _extract_best_point(chunks, section_title, domain, llm)
@@ -430,6 +437,7 @@ def process_section_node(state: dict) -> dict:
                 console.print(f"  [green]+[/] {domain}: {point[:80]}…" if len(point) > 80 else f"  [green]+[/] {domain}: {point}")
 
                 # Resynthesize every time we have a new point
+                console.print(f"  [dim]  synthesising section (LLM #{llm_calls+1}) …[/]")
                 section_text = _synthesize_section(section_title, points, llm)
                 llm_calls += 1
 
@@ -441,15 +449,18 @@ def process_section_node(state: dict) -> dict:
                         if n.get("status") in ("active", "complete")
                     )
                     _write_incremental_report(doc_id, query, state.get("document_title", ""), cfg)
+            else:
+                console.print(f"  [dim]  {domain}: NOT RELEVANT[/]")
 
             # Check goal after each URL
             if g.max_sources and total_sources >= g.max_sources:
                 stop_processing = True
                 break
-            if g.max_words and total_words >= g.max_words:
+            if g.target_words and total_words >= g.target_words:
                 stop_processing = True
                 break
 
+        console.print(f"  [dim]  sleeping {cfg.search_delay_seconds}s …[/]")
         time.sleep(cfg.search_delay_seconds)
 
     # Finalise section
@@ -497,9 +508,9 @@ def check_completion_node(state: dict) -> dict:
             reason = f"Reached max sources ({g.max_sources})"
 
     # 3. Goal: max words
-    if not reason and g.max_words:
-        if state.get("total_words_written", 0) >= g.max_words:
-            reason = f"Reached max words ({g.max_words})"
+    if not reason and g.target_words:
+        if state.get("total_words_written", 0) >= g.target_words:
+            reason = f"Reached max words ({g.target_words})"
 
     # 4. Goal: max duration
     if not reason and g.max_duration_seconds:
