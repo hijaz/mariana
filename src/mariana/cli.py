@@ -1,4 +1,5 @@
 import atexit
+import os
 import re
 import time
 from pathlib import Path
@@ -14,6 +15,12 @@ from mariana.utils.config import load_config, save_setting
 from mariana.utils.llm import check_ollama, get_planner_llm, get_summarizer_llm
 from mariana.utils.searxng import SearXNGManager
 from mariana.utils.tracing import write_trace
+
+# Ask the Linux OOM killer to spare our process — prefer killing other things first.
+try:
+    Path(f"/proc/{os.getpid()}/oom_score_adj").write_text("-200")
+except OSError:
+    pass
 
 NODE_LABELS = {
     "init_document":    "Initialising document",
