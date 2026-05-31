@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mariana Research</title>
+<style>
+  :root {
+    --bg: #0e1117;
+    --surface: #161b22;
+    --surface2: #1c2128;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+    --orange: #ffa657;
+    --radius: 8px;
+    --mono: 'JetBrains Mono', 'Fira Code', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
+
+  /* Layout */
+  .app { display: grid; grid-template-columns: 280px 1fr; grid-template-rows: 48px 1fr; height: 100vh; }
+  .topbar { grid-column: 1/-1; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; padding: 0 16px; }
+  .sidebar { background: var(--surface); border-right: 1px solid var(--border); overflow-y: auto; display: flex; flex-direction: column; }
+  .main { display: grid; grid-template-columns: 1fr 340px; overflow: hidden; }
+  .content { overflow-y: auto; padding: 20px; }
+  .rightpanel { background: var(--surface); border-left: 1px solid var(--border); overflow-y: auto; display: flex; flex-direction: column; }
+
+  /* Topbar */
+  .topbar-logo { font-weight: 700; font-size: 16px; color: var(--accent); letter-spacing: -0.5px; }
+  .topbar-status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .status-dot.running { background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse 1.5s infinite; }
+  .status-dot.done { background: var(--accent); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  .topbar-timer { font-family: var(--mono); font-size: 12px; color: var(--yellow); margin-left: 4px; }
+  .topbar-spacer { flex: 1; }
+  .btn { padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface2); color: var(--text); cursor: pointer; font-size: 13px; transition: background .15s; }
+  .btn:hover { background: var(--border); }
+  .btn-primary { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 600; }
+  .btn-primary:hover { background: #79b8ff; border-color: #79b8ff; }
+  .btn-danger { background: rgba(248,81,73,.15); color: var(--red); border-color: var(--red); font-weight: 600; }
+  .btn-danger:hover { background: rgba(248,81,73,.3); }
+
+  /* Search form */
+  .search-form { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
+  .search-form input { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; color: var(--text); font-size: 13px; outline: none; }
+  .search-form input:focus { border-color: var(--accent); }
+
+  /* Sidebar sections */
+  .sidebar-section { padding: 8px 12px 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); font-weight: 600; }
+  .doc-item { padding: 10px 16px; cursor: pointer; border-bottom: 1px solid var(--border); transition: background .1s; }
+  .doc-item:hover { background: var(--surface2); }
+  .doc-item.active { background: var(--surface2); border-left: 2px solid var(--accent); }
+  .doc-item-title { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .doc-item-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+  /* TOC */
+  .toc-panel { padding: 16px; }
+  .toc-title { font-size: 13px; font-weight: 700; margin-bottom: 10px; color: var(--text); }
+  .toc-node { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; margin-bottom: 2px; font-size: 12px; }
+  .toc-node.active { background: rgba(88,166,255,.1); }
+  .toc-node .toc-icon { flex-shrink: 0; width: 16px; text-align: center; }
+  .toc-node .toc-words { color: var(--muted); font-family: var(--mono); font-size: 11px; margin-left: auto; }
+  .toc-node.complete .toc-label { color: var(--green); }
+  .toc-node.pending .toc-label { color: var(--muted); }
+  .toc-node.active-section .toc-label { color: var(--accent); font-weight: 600; }
+
+  /* Stats bar */
+  .stats-bar { display: flex; gap: 16px; padding: 12px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .stat { display: flex; flex-direction: column; gap: 2px; }
+  .stat-val { font-family: var(--mono); font-size: 18px; font-weight: 700; color: var(--accent); }
+  .stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+
+  /* Report viewer */
+  .report-area { padding: 24px 28px; max-width: 820px; }
+  .report-area h1 { font-size: 22px; margin-bottom: 8px; }
+  .report-area h2 { font-size: 16px; margin: 20px 0 8px; color: var(--accent); }
+  .report-area h3 { font-size: 14px; margin: 14px 0 6px; }
+  .report-area p { line-height: 1.7; color: #cdd9e5; margin-bottom: 12px; }
+  .report-area em { color: var(--muted); }
+  .report-area code { font-family: var(--mono); background: var(--surface2); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  .report-area pre { background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; overflow-x: auto; margin-bottom: 14px; }
+
+  /* Activity feed */
+  .feed-header { padding: 12px 16px 8px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; border-bottom: 1px solid var(--border); }
+  .feed { flex: 1; overflow-y: auto; padding: 8px 0; }
+  .feed-item { padding: 5px 16px; font-size: 12px; display: flex; gap: 8px; align-items: flex-start; border-bottom: 1px solid rgba(48,54,61,.5); }
+  .feed-item:last-child { border-bottom: none; }
+  .feed-ts { font-family: var(--mono); color: var(--muted); font-size: 11px; flex-shrink: 0; padding-top: 1px; }
+  .feed-msg { line-height: 1.4; word-break: break-all; }
+  .feed-item.visiting .feed-msg { color: var(--yellow); }
+  .feed-item.done .feed-msg { color: var(--green); }
+  .feed-item.failed .feed-msg { color: var(--red); }
+  .feed-item.section .feed-msg { color: var(--purple); font-weight: 500; }
+  .feed-item.toc .feed-msg { color: var(--accent); }
+  .feed-item.report .feed-msg { color: var(--orange); font-weight: 600; }
+
+  /* URL list */
+  .urls-panel { padding: 12px; }
+  .urls-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin-bottom: 8px; }
+  .url-entry { padding: 5px 8px; border-radius: 5px; margin-bottom: 3px; font-size: 11px; font-family: var(--mono); display: flex; gap: 6px; align-items: center; }
+  .url-entry.visiting { background: rgba(210,153,34,.1); color: var(--yellow); }
+  .url-entry.done { background: rgba(63,185,80,.08); color: var(--green); }
+  .url-entry.failed { background: rgba(248,81,73,.08); color: var(--red); }
+  .url-badge { flex-shrink: 0; width: 6px; height: 6px; border-radius: 50%; }
+  .url-badge.visiting { background: var(--yellow); }
+  .url-badge.done { background: var(--green); }
+  .url-badge.failed { background: var(--red); }
+  .url-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* Queries panel */
+  .queries-panel { padding: 12px; border-top: 1px solid var(--border); }
+  .query-item { padding: 4px 8px; background: rgba(88,166,255,.07); border-radius: 4px; font-size: 11px; color: var(--accent); margin-bottom: 3px; }
+
+  /* Modal */
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100; align-items: center; justify-content: center; }
+  .modal-overlay.open { display: flex; }
+  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; width: 480px; max-width: 90vw; }
+  .modal h2 { font-size: 16px; margin-bottom: 16px; }
+  .form-row { margin-bottom: 12px; }
+  .form-row label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .form-row input { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; color: var(--text); font-size: 13px; outline: none; }
+  .form-row input:focus { border-color: var(--accent); }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
+  /* System panel */
+  .sys-panel { padding: 12px 16px; border-top: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+  .sys-row { display: flex; justify-content: space-between; padding: 2px 0; }
+  .sys-val { color: var(--text); font-family: var(--mono); }
+
+  /* Empty state */
+  .empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--muted); gap: 12px; text-align: center; padding: 32px; }
+  .empty-title { font-size: 18px; color: var(--text); }
+
+  /* Tabs */
+  .tabs { display: flex; border-bottom: 1px solid var(--border); padding: 0 16px; }
+  .tab { padding: 10px 14px; font-size: 12px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -1px; }
+  .tab.active { color: var(--accent); border-color: var(--accent); }
+
+  /* Section live preview */
+  .live-section { background: rgba(88,166,255,.04); border: 1px solid rgba(88,166,255,.15); border-radius: var(--radius); padding: 14px; margin-bottom: 16px; }
+  .live-section-title { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--accent); margin-bottom: 8px; font-weight: 600; }
+  .live-section-body { font-size: 13px; line-height: 1.6; color: var(--text); }
+
+  /* Stop conditions badges */
+  .conditions { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 16px; border-bottom: 1px solid var(--border); }
+  .condition-badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: rgba(210,153,34,.12); color: var(--yellow); border: 1px solid rgba(210,153,34,.3); }
+
+  /* Form grid */
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+
+  /* Scrollbars */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- Topbar -->
+  <div class="topbar">
+    <span class="topbar-logo">⚓ Mariana</span>
+    <div class="topbar-status">
+      <div class="status-dot" id="statusDot"></div>
+      <span id="statusText">Idle</span>
+      <span class="topbar-timer" id="timerEl" style="display:none"></span>
+    </div>
+    <div class="conditions" id="conditionsBar" style="display:none;border-bottom:none;padding:0 12px;background:transparent"></div>
+    <div class="topbar-spacer"></div>
+    <button class="btn btn-danger" id="stopBtn" style="display:none" onclick="stopResearch()">⏹ Stop</button>
+    <button class="btn" onclick="loadHistory()">↻ Refresh</button>
+    <button class="btn btn-primary" onclick="openModal()">+ New Research</button>
+  </div>
+
+  <!-- Sidebar: document history -->
+  <div class="sidebar">
+    <div class="search-form">
+      <input id="searchInput" placeholder="Filter reports…" oninput="filterDocs()">
+    </div>
+    <div class="sidebar-section">Reports</div>
+    <div id="docList"></div>
+  </div>
+
+  <!-- Main content area -->
+  <div class="main">
+    <div class="content" id="mainContent">
+      <div class="empty">
+        <span style="font-size:48px">🔭</span>
+        <span class="empty-title">Ready to research</span>
+        <span>Start a new research run or select a past report from the sidebar.</span>
+        <button class="btn btn-primary" onclick="openModal()">+ New Research</button>
+      </div>
+    </div>
+
+    <!-- Right panel: live feed + urls + queries + system -->
+    <div class="rightpanel">
+      <div class="tabs">
+        <div class="tab active" onclick="switchTab('feed',this)">Feed</div>
+        <div class="tab" onclick="switchTab('urls',this)">URLs</div>
+        <div class="tab" onclick="switchTab('queries',this)">Queries</div>
+        <div class="tab" onclick="switchTab('system',this)">System</div>
+      </div>
+
+      <div id="tab-feed">
+        <div class="feed-header">Live Activity</div>
+        <div class="feed" id="feedList"></div>
+      </div>
+
+      <div id="tab-urls" style="display:none">
+        <div class="urls-panel">
+          <div class="urls-title">URLs — <span id="urlCount">0</span> visited</div>
+          <div id="urlList"></div>
+        </div>
+      </div>
+
+      <div id="tab-queries" style="display:none">
+        <div class="queries-panel">
+          <div class="urls-title">Current search queries</div>
+          <div id="queriesList"><span style="color:var(--muted);font-size:12px">None yet</span></div>
+        </div>
+      </div>
+
+      <div id="tab-system" style="display:none">
+        <div class="sys-panel" id="sysPanel">Loading…</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- New research modal -->
+<div class="modal-overlay" id="modalOverlay" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <h2>New Research Run</h2>
+    <div class="form-row">
+      <label>Research question *</label>
+      <input id="fQuery" placeholder="What is fusion energy?" autofocus>
+    </div>
+    <div class="form-grid">
+      <div class="form-row">
+        <label>Max sources</label>
+        <input id="fSources" type="number" placeholder="e.g. 10">
+      </div>
+      <div class="form-row">
+        <label>Max iterations</label>
+        <input id="fIterations" type="number" placeholder="e.g. 3">
+      </div>
+      <div class="form-row">
+        <label>Target words</label>
+        <input id="fWords" type="number" placeholder="e.g. 2000">
+      </div>
+      <div class="form-row">
+        <label>Duration limit</label>
+        <input id="fDuration" placeholder="e.g. 30m, 1h, 2h30m">
+      </div>
+      <div class="form-row">
+        <label>Min sections</label>
+        <input id="fMinSections" type="number" placeholder="3">
+      </div>
+      <div class="form-row">
+        <label>Max sections</label>
+        <input id="fMaxSections" type="number" placeholder="4">
+      </div>
+    </div>
+    <div class="form-row">
+      <label>Required topics <span style="color:var(--muted);font-weight:400">(comma-separated, all must be covered before stopping)</span></label>
+      <input id="fRequire" placeholder="e.g. cost, safety, timeline">
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="startResearch()">Start →</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+let docs = [];
+let activeDocId = null;
+let evtSource = null;
+let running = false;
+let startTime = null;
+let timerInterval = null;
+let urlMap = {};  // url → status
+let feedItems = [];
+const MAX_FEED = 200;
+
+// ── SSE connection ─────────────────────────────────────────────────────────────
+function connectSSE(docId) {
+  if (evtSource) { evtSource.close(); evtSource = null; }
+  const url = docId ? `/events?doc_id=${docId}` : '/events';
+  evtSource = new EventSource(url);
+  evtSource.onmessage = e => {
+    try { handleEvent(JSON.parse(e.data)); } catch(_) {}
+  };
+  evtSource.onerror = () => {
+    setTimeout(() => connectSSE(docId), 3000);
+  };
+}
+
+function handleEvent(ev) {
+  const type = ev.type;
+  const docId = ev.doc_id;
+
+  // Feed entry
+  const ts = new Date(ev.ts * 1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  let cls = '', msg = '';
+
+  if (type === 'doc_created') {
+    cls = 'toc'; msg = `📄 New doc: ${ev.title}`;
+    startTimer();
+    setRunning(true);
+    loadHistory();
+    activeDocId = ev.doc_id;
+    openLiveView(ev.doc_id, ev.query, ev.title);
+    // show conditions from current goal (polled shortly after)
+    fetch('/api/research/status').then(r=>r.json()).then(d => renderConditions(d.goal)).catch(()=>{});
+  } else if (type === 'toc_planned') {
+    cls = 'toc'; msg = `📑 TOC: ${ev.sections.join(', ')}`;
+    renderTOC(docId, ev.sections.map(s => ({title: s, status: 'pending', word_count: 0})));
+  } else if (type === 'queries_generated') {
+    cls = 'section'; msg = `🔍 Queries for "${ev.section}"`;
+    renderQueries(ev.queries);
+  } else if (type === 'url_visiting') {
+    cls = 'visiting'; msg = `⟳ ${ev.domain} — ${ev.url.slice(0,60)}`;
+    urlMap[ev.url] = 'visiting';
+    renderURLs();
+  } else if (type === 'url_done') {
+    cls = 'done';
+    if (ev.relevant) {
+      msg = `✓ ${ev.domain}: ${(ev.point||'').slice(0,80)}`;
+    } else {
+      msg = `∅ ${ev.domain}: not relevant`;
+    }
+    urlMap[ev.url] = ev.relevant ? 'done' : 'failed';
+    renderURLs();
+  } else if (type === 'url_failed') {
+    cls = 'failed'; msg = `✗ ${ev.domain}: ${ev.error}`;
+    urlMap[ev.url] = 'failed';
+    renderURLs();
+  } else if (type === 'section_updated') {
+    cls = 'section'; msg = `✍ Section updated: ${ev.section} (${ev.total_words}w)`;
+    updateStats({total_words: ev.total_words, total_sources: ev.total_sources});
+    updateLiveSection(ev.section, ev.text);
+    refreshTOCFromServer(docId);
+  } else if (type === 'cancelled') {
+    cls = 'failed'; msg = `⏹ ${ev.message}`;
+    setRunning(false); stopTimer();
+    renderConditions(null);
+  } else if (type === 'report_ready') {
+    cls = 'report'; msg = `🏁 Report complete! ${ev.word_count} words`;
+    setRunning(false);
+    stopTimer();
+    renderConditions(null);
+    loadHistory();
+    showReport(ev.report, docId);
+  } else if (type === 'error') {
+    cls = 'failed'; msg = `⚠ Error: ${ev.message}`;
+    setRunning(false); stopTimer();
+  } else {
+    msg = `${type}: ${JSON.stringify(ev).slice(0,80)}`;
+  }
+
+  if (msg) addFeedItem(ts, cls, msg);
+}
+
+// ── Timer ─────────────────────────────────────────────────────────────────────
+function startTimer() {
+  startTime = Date.now();
+  const el = document.getElementById('timerEl');
+  el.style.display = '';
+  if (timerInterval) clearInterval(timerInterval);
+  timerInterval = setInterval(() => {
+    const s = Math.floor((Date.now() - startTime) / 1000);
+    const m = Math.floor(s / 60), sec = s % 60;
+    el.textContent = `${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+  }, 1000);
+}
+function stopTimer() { clearInterval(timerInterval); }
+
+function setRunning(r) {
+  running = r;
+  const dot = document.getElementById('statusDot');
+  const txt = document.getElementById('statusText');
+  const stopBtn = document.getElementById('stopBtn');
+  dot.className = 'status-dot ' + (r ? 'running' : 'done');
+  txt.textContent = r ? 'Researching…' : 'Done';
+  stopBtn.style.display = r ? '' : 'none';
+}
+
+// ── Feed ──────────────────────────────────────────────────────────────────────
+function addFeedItem(ts, cls, msg) {
+  feedItems.unshift({ts, cls, msg});
+  if (feedItems.length > MAX_FEED) feedItems.pop();
+  renderFeed();
+}
+function renderFeed() {
+  const el = document.getElementById('feedList');
+  el.innerHTML = feedItems.map(f =>
+    `<div class="feed-item ${f.cls}"><span class="feed-ts">${f.ts}</span><span class="feed-msg">${esc(f.msg)}</span></div>`
+  ).join('');
+}
+
+// ── URLs ──────────────────────────────────────────────────────────────────────
+function renderURLs() {
+  const el = document.getElementById('urlList');
+  const entries = Object.entries(urlMap);
+  document.getElementById('urlCount').textContent = entries.filter(([,s])=>s==='done').length;
+  el.innerHTML = entries.slice(-60).reverse().map(([url, status]) => {
+    const domain = url.replace(/https?:\/\//, '').split('/')[0].replace('www.','');
+    return `<div class="url-entry ${status}"><div class="url-badge ${status}"></div><span class="url-text" title="${esc(url)}">${esc(domain)}${url.length>50?' …':'  '+url.slice(url.indexOf(domain)+domain.length,50)}</span></div>`;
+  }).join('');
+}
+
+// ── Queries ───────────────────────────────────────────────────────────────────
+function renderQueries(queries) {
+  const el = document.getElementById('queriesList');
+  el.innerHTML = queries.map(q => `<div class="query-item">${esc(q)}</div>`).join('');
+}
+
+// ── TOC ───────────────────────────────────────────────────────────────────────
+function renderTOC(docId, nodes) {
+  const tocEl = document.getElementById('liveToC');
+  if (!tocEl) return;
+  tocEl.innerHTML = nodes.map(n => {
+    const icon = n.status==='complete' ? '✓' : n.status==='active' ? '→' : '○';
+    const cls = n.status==='complete' ? 'complete' : n.status==='active' ? 'active-section' : 'pending';
+    const words = n.word_count > 0 ? `${n.word_count}w` : '';
+    return `<div class="toc-node ${cls}"><span class="toc-icon">${icon}</span><span class="toc-label">${esc(n.title)}</span><span class="toc-words">${words}</span></div>`;
+  }).join('');
+}
+
+function refreshTOCFromServer(docId) {
+  if (!docId) return;
+  fetch(`/api/docs/${docId}`).then(r=>r.json()).then(data => {
+    renderTOC(docId, data.toc || []);
+  }).catch(()=>{});
+}
+
+// ── Stats ─────────────────────────────────────────────────────────────────────
+function updateStats(data) {
+  if (data.total_words !== undefined) {
+    const el = document.getElementById('statWords');
+    if (el) el.textContent = data.total_words;
+  }
+  if (data.total_sources !== undefined) {
+    const el = document.getElementById('statSources');
+    if (el) el.textContent = data.total_sources;
+  }
+}
+
+// ── Live view ─────────────────────────────────────────────────────────────────
+let liveSections = {};
+
+function openLiveView(docId, query, title) {
+  liveSections = {};
+  urlMap = {};
+  const el = document.getElementById('mainContent');
+  el.innerHTML = `
+    <div class="report-area">
+      <h1>${esc(title)}</h1>
+      <p style="color:var(--muted);font-size:12px">${esc(query)}</p>
+      <div class="stats-bar">
+        <div class="stat"><div class="stat-val" id="statWords">0</div><div class="stat-label">Words</div></div>
+        <div class="stat"><div class="stat-val" id="statSources">0</div><div class="stat-label">Sources</div></div>
+        <div class="stat"><div class="stat-val" id="statLLM">0</div><div class="stat-label">LLM calls</div></div>
+      </div>
+      <div class="toc-panel">
+        <div class="toc-title">Table of Contents</div>
+        <div id="liveToC"></div>
+      </div>
+      <div id="liveSections"></div>
+    </div>`;
+}
+
+function updateLiveSection(sectionTitle, text) {
+  liveSections[sectionTitle] = text;
+  const el = document.getElementById('liveSections');
+  if (!el) return;
+  el.innerHTML = Object.entries(liveSections).map(([title, body]) =>
+    `<div class="live-section">
+      <div class="live-section-title">${esc(title)}</div>
+      <div class="live-section-body">${esc(body)}</div>
+    </div>`
+  ).join('');
+}
+
+// ── Show final report ─────────────────────────────────────────────────────────
+function showReport(markdown, docId) {
+  const el = document.getElementById('mainContent');
+  if (!markdown) {
+    if (docId) loadDocReport(docId);
+    return;
+  }
+  el.innerHTML = `<div class="report-area">${renderMarkdown(markdown)}</div>`;
+  refreshTOCFromServer(docId);
+}
+
+function loadDocReport(docId) {
+  fetch(`/api/docs/${docId}/report`).then(r=>r.json()).then(data => {
+    const el = document.getElementById('mainContent');
+    el.innerHTML = `<div class="report-area">${renderMarkdown(data.markdown)}</div>`;
+  }).catch(()=>{});
+}
+
+// Minimal markdown renderer (headings, paragraphs, bold, em)
+function renderMarkdown(md) {
+  if (!md) return '<p style="color:var(--muted)">No content yet.</p>';
+  let html = md
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    // headings
+    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
+    // bold / italic
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    // code
+    .replace(/`(.+?)`/g, '<code>$1</code>')
+    // paragraphs
+    .replace(/\n\n+/g, '</p><p>')
+    .replace(/\n/g, '<br>');
+  return '<p>' + html + '</p>';
+}
+
+// ── History ───────────────────────────────────────────────────────────────────
+function loadHistory() {
+  fetch('/api/docs').then(r=>r.json()).then(data => {
+    docs = data;
+    renderDocList(docs);
+  }).catch(()=>{});
+}
+
+function filterDocs() {
+  const q = document.getElementById('searchInput').value.toLowerCase();
+  renderDocList(docs.filter(d => d.title.toLowerCase().includes(q) || d.query.toLowerCase().includes(q)));
+}
+
+function renderDocList(list) {
+  const el = document.getElementById('docList');
+  if (!list.length) {
+    el.innerHTML = '<div style="padding:16px;color:var(--muted);font-size:12px">No reports yet</div>';
+    return;
+  }
+  el.innerHTML = list.map(d => `
+    <div class="doc-item ${d.id===activeDocId?'active':''}" onclick="selectDoc('${d.id}')">
+      <div class="doc-item-title">${esc(d.title)}</div>
+      <div class="doc-item-meta">${fmtDate(d.created_at)} · ${d.total_words}w</div>
+    </div>`).join('');
+}
+
+function selectDoc(id) {
+  activeDocId = id;
+  connectSSE(id);
+  loadDocReport(id);
+  fetch(`/api/docs/${id}`).then(r=>r.json()).then(data => {
+    renderTOCInSidebar(data);
+  });
+  renderDocList(docs);
+}
+
+function renderTOCInSidebar(data) {
+  const el = document.getElementById('mainContent');
+  const doc = data.doc;
+  const toc = data.toc || [];
+  const stats = `<div class="stats-bar">
+    <div class="stat"><div class="stat-val">${doc.total_words}</div><div class="stat-label">Words</div></div>
+    <div class="stat"><div class="stat-val">${toc.filter(n=>n.status==='complete').length}</div><div class="stat-label">Sections</div></div>
+  </div>`;
+  const tocHtml = toc.map(n => {
+    const icon = n.status==='complete' ? '✓' : n.status==='active' ? '→' : '○';
+    const cls = n.status==='complete' ? 'complete' : n.status==='active' ? 'active-section' : 'pending';
+    return `<div class="toc-node ${cls}"><span class="toc-icon">${icon}</span><span class="toc-label">${esc(n.title)}</span><span class="toc-words">${n.word_count>0?n.word_count+'w':''}</span></div>`;
+  }).join('');
+  // sections preview
+  const sectionsHtml = toc.filter(n=>n.content_snippet).map(n =>
+    `<div class="live-section"><div class="live-section-title">${esc(n.title)}</div><div class="live-section-body">${esc(n.content_snippet)}</div></div>`
+  ).join('');
+
+  el.innerHTML = `<div class="report-area">
+    <h1>${esc(doc.title)}</h1>
+    <p style="color:var(--muted);font-size:12px">${esc(doc.query)}</p>
+    ${stats}
+    <div class="toc-panel"><div class="toc-title">Table of Contents</div>${tocHtml}</div>
+    ${sectionsHtml}
+    <button class="btn" style="margin-top:12px" onclick="loadDocReport('${doc.id}')">View full report</button>
+  </div>`;
+}
+
+// ── System panel ──────────────────────────────────────────────────────────────
+function loadSystemInfo() {
+  fetch('/api/system').then(r=>r.json()).then(sys => {
+    const el = document.getElementById('sysPanel');
+    const memFree = sys.mem_mb.MemAvailable || '?';
+    const memTotal = sys.mem_mb.MemTotal || '?';
+    const swapFree = sys.mem_mb.SwapFree || '?';
+    el.innerHTML = `
+      <div class="sys-row"><span>Status</span><span class="sys-val" style="color:${sys.ollama_ok?'var(--green)':'var(--red)'}">${sys.ollama_ok?'Ollama ✓':'Ollama ✗'}</span></div>
+      <div class="sys-row"><span>Model</span><span class="sys-val">${esc(sys.planner_model)}</span></div>
+      <div class="sys-row"><span>Ollama</span><span class="sys-val">${esc(sys.ollama_url)}</span></div>
+      <div class="sys-row"><span>SearXNG</span><span class="sys-val">:${sys.searxng_port}</span></div>
+      <div class="sys-row"><span>RAM free</span><span class="sys-val">${memFree} / ${memTotal} MB</span></div>
+      <div class="sys-row"><span>Swap free</span><span class="sys-val">${swapFree} MB</span></div>
+      <div class="sys-row"><span>Output</span><span class="sys-val" style="font-size:10px">${esc(sys.output_dir)}</span></div>
+    `;
+  }).catch(()=>{
+    document.getElementById('sysPanel').innerHTML = '<span style="color:var(--red)">Could not load system info</span>';
+  });
+}
+
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+function switchTab(name, el) {
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+  ['feed','urls','queries','system'].forEach(t => {
+    document.getElementById('tab-'+t).style.display = t===name ? '' : 'none';
+  });
+  if (name === 'system') loadSystemInfo();
+}
+
+function stopResearch() {
+  if (!confirm('Stop the current research run?')) return;
+  fetch('/api/research/stop', {method:'POST'}).then(r=>r.json()).then(d => {
+    if (d.stopped) {
+      addFeedItem(nowTs(), 'failed', '⏹ Stop requested — finishing current URL…');
+    }
+  });
+}
+
+// ── Stop conditions display ──────────────────────────────────────────────────────────────
+function renderConditions(goal) {
+  const el = document.getElementById('conditionsBar');
+  if (!el) return;
+  if (!goal) { el.style.display = 'none'; return; }
+  const badges = [];
+  if (goal.max_sources)    badges.push(`≤ ${goal.max_sources} sources`);
+  if (goal.max_iterations) badges.push(`≤ ${goal.max_iterations} iterations`);
+  if (goal.target_words)   badges.push(`≥ ${goal.target_words} words`);
+  if (goal.duration)       badges.push(`⏱ ${goal.duration}`);
+  if (goal.min_sections)   badges.push(`min ${goal.min_sections} sections`);
+  if (goal.max_sections)   badges.push(`max ${goal.max_sections} sections`);
+  if (goal.require && goal.require.length) goal.require.forEach(t => badges.push(`must cover: ${t}`));
+  if (!badges.length)      { el.style.display = 'none'; return; }
+  el.style.display = '';
+  el.innerHTML = '<span style="font-size:11px;color:var(--muted);margin-right:4px">Stop when:</span>' +
+    badges.map(b => `<span class="condition-badge">${esc(b)}</span>`).join('');
+}
+
+function nowTs() {
+  return new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+
+  document.getElementById('modalOverlay').classList.add('open');
+  document.getElementById('fQuery').focus();
+}
+function closeModal() {
+  document.getElementById('modalOverlay').classList.remove('open');
+}
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeModal();
+  if (e.key === 'Enter' && document.getElementById('modalOverlay').classList.contains('open')) startResearch();
+});
+
+function startResearch() {
+  const query = document.getElementById('fQuery').value.trim();
+  if (!query) return;
+  const requireRaw = document.getElementById('fRequire').value.trim();
+  const requireList = requireRaw ? requireRaw.split(',').map(s=>s.trim()).filter(Boolean) : [];
+  const body = {
+    query,
+    max_sources:    parseInt(document.getElementById('fSources').value)     || null,
+    max_iterations: parseInt(document.getElementById('fIterations').value)  || null,
+    target_words:   parseInt(document.getElementById('fWords').value)       || null,
+    duration:       document.getElementById('fDuration').value.trim()       || null,
+    require:        requireList,
+    min_sections:   parseInt(document.getElementById('fMinSections').value) || null,
+    max_sections:   parseInt(document.getElementById('fMaxSections').value) || null,
+  };
+  Object.keys(body).forEach(k => body[k]===null && delete body[k]);
+  fetch('/api/research', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+    .then(r=>r.json()).then(data => {
+      if (data.error) { alert(data.error); return; }
+      closeModal();
+      feedItems = [];
+      urlMap = {};
+      renderFeed();
+      renderURLs();
+      connectSSE(null);
+    });
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function fmtDate(s) {
+  if (!s) return '';
+  try { return new Date(s).toLocaleDateString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}); } catch(_) { return s; }
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+loadHistory();
+connectSSE(null);
+// Poll running status & conditions
+setInterval(() => {
+  fetch('/api/research/status').then(r=>r.json()).then(d => {
+    if (d.running && !running) { setRunning(true); startTimer(); }
+    else if (!d.running && running) { setRunning(false); stopTimer(); }
+    renderConditions(d.running ? d.goal : null);
+  }).catch(()=>{});
+}, 5000);
+</script>
+</body>
+</html>

@@ -20,6 +20,7 @@ from mariana.prompts import (
 from mariana.state import ResearchGoal
 from mariana.tools.search import filter_for_diversity, raw_scrape, raw_search
 from mariana.utils.config import ensure_output_dir, load_config
+from mariana.utils.events import emit
 from mariana.utils.llm import get_planner_llm, get_summarizer_llm, truncate_for_llm
 from mariana.utils.retry import with_llm_retry
 from mariana.utils.store import (
@@ -258,6 +259,7 @@ def init_document_node(state: dict) -> dict:
     doc_id = create_document(query)
     # Simple title: capitalise query, cap at 60 chars
     title = query.strip().rstrip("?").title()[:60]
+    emit("doc_created", {"doc_id": doc_id, "query": query, "title": title}, doc_id=doc_id)
     return {
         "doc_id": doc_id,
         "document_title": title,
@@ -289,6 +291,7 @@ def plan_toc_node(state: dict) -> dict:
         create_toc_node(doc_id, title, depth=0, order_index=idx)
 
     console.print(f"[bold]TOC:[/] {len(titles[:n])} sections planned")
+    emit("toc_planned", {"sections": titles[:n]}, doc_id=doc_id)
     return {
         "llm_call_count": state.get("llm_call_count", 0) + 1,
         "status": f"TOC planned: {len(titles[:n])} sections",
@@ -297,6 +300,13 @@ def plan_toc_node(state: dict) -> dict:
 
 def select_section_node(state: dict) -> dict:
     """Pick the next pending section and load it into state."""
+    from mariana.utils.cancel import is_cancelled
+    if is_cancelled():
+        return {
+            "should_stop": True,
+            "stop_reason": "Cancelled by user",
+            "status": "Cancelled",
+        }
     doc_id = state["doc_id"]
     pending = get_pending_sections(doc_id)
     if not pending:
@@ -333,6 +343,8 @@ def generate_queries_node(state: dict) -> dict:
     except Exception:
         queries = _deterministic_queries(combined_topic, 4)
 
+    doc_id = state.get("doc_id", "")
+    emit("queries_generated", {"section": section_title, "queries": queries}, doc_id=doc_id)
     return {
         "current_search_queries": queries,
         "query_generation": gen + 1,
@@ -383,6 +395,10 @@ def process_section_node(state: dict) -> dict:
     for qi, search_query in enumerate(queries, 1):
         if stop_processing:
             break
+        from mariana.utils.cancel import is_cancelled
+        if is_cancelled():
+            stop_processing = True
+            break
         if goal_met:
             stop_processing = True
             break
@@ -413,14 +429,17 @@ def process_section_node(state: dict) -> dict:
 
             domain = urlparse(url).netloc.replace("www.", "")
             console.print(f"  [dim]  scraping {domain} …[/]")
+            emit("url_visiting", {"url": url, "domain": domain, "section": section_title}, doc_id=doc_id)
             try:
                 content = raw_scrape(url, max_chars=cfg.max_page_chars)
             except Exception as exc:
                 console.print(f"  [dim]  scrape failed {domain}: {exc}[/]")
+                emit("url_failed", {"url": url, "domain": domain, "error": str(exc)}, doc_id=doc_id)
                 continue
 
             if not content or len(content) < 100:
                 console.print(f"  [dim]  {domain}: empty/too short, skipping[/]")
+                emit("url_failed", {"url": url, "domain": domain, "error": "empty"}, doc_id=doc_id)
                 continue
 
             scraped_urls.add(url)
@@ -449,8 +468,11 @@ def process_section_node(state: dict) -> dict:
                         if n.get("status") in ("active", "complete")
                     )
                     _write_incremental_report(doc_id, query, state.get("document_title", ""), cfg)
+                    emit("section_updated", {"section": section_title, "node_id": node_id, "text": section_text, "total_words": total_words, "total_sources": total_sources}, doc_id=doc_id)
+                emit("url_done", {"url": url, "domain": domain, "point": point, "section": section_title, "relevant": True}, doc_id=doc_id)
             else:
                 console.print(f"  [dim]  {domain}: NOT RELEVANT[/]")
+                emit("url_done", {"url": url, "domain": domain, "point": None, "section": section_title, "relevant": False}, doc_id=doc_id)
 
             # Check goal after each URL
             if g.max_sources and total_sources >= g.max_sources:
@@ -601,6 +623,7 @@ def finalize_node(state: dict) -> dict:
 
     word_count = len(report.split())
     console.print(f"[bold green]Report written:[/] {report_path} ({word_count} words)")
+    emit("report_ready", {"path": str(report_path), "word_count": word_count, "report": report}, doc_id=doc_id)
 
     return {
         "final_report": str(report_path),

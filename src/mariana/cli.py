@@ -140,21 +140,14 @@ def _step(label: str, fn, state: dict, start: float) -> dict:
 
 
 def _run_pipeline(state: dict, start: float) -> dict:
-    """Execute the research pipeline using the LangGraph StateGraph."""
+    """Execute the research pipeline using the LangGraph StateGraph.
+
+    graph.invoke() returns the authoritative final state.  Progress is visible
+    from each node's own console.print calls (they run synchronously inside invoke).
+    """
     from mariana.graph import get_graph
 
-    graph = get_graph()
-    final_state = state
-    for chunk in graph.stream(state, stream_mode="updates"):
-        for node_name, update in chunk.items():
-            label = NODE_LABELS.get(node_name, node_name)
-            final_state = {**final_state, **update}
-            elapsed = time.time() - start
-            status = update.get("status", "")
-            console.print(
-                f"  [dim]{elapsed:5.1f}s  {_rss_mb():4d}MB[/]  [bold cyan]{label}[/]  [green]done[/]  {status}"
-            )
-    return final_state
+    return get_graph().invoke(state)
 
 
 def _run_query(query: str, cfg, goal: ResearchGoal | None = None):
@@ -193,7 +186,8 @@ def _run_query(query: str, cfg, goal: ResearchGoal | None = None):
         pass
 
     _print_session_summary(final_state, elapsed, report_path)
-    console.print(Markdown(final_state.get("final_report", "")))
+    if report_path and report_path.exists():
+        console.print(Markdown(report_path.read_text(encoding="utf-8")))
 
 
 
@@ -311,4 +305,23 @@ def status():
     table.add_row("Output dir", str(output_dir))
 
     console.print(Panel(table, border_style="blue"))
+
+
+@cli.command()
+@click.option("--host", default="127.0.0.1", show_default=True, help="Bind address")
+@click.option("--port", default=7860, show_default=True, type=int, help="HTTP port")
+@click.option("--open/--no-open", "open_browser", default=True, help="Open browser on start")
+def ui(host, port, open_browser):
+    "Start the Mariana web UI (research dashboard)."
+    import uvicorn
+    from mariana.server import app
+
+    url = f"http://{host}:{port}"
+    console.print(Panel(f"[bold]Mariana UI[/] → [blue underline]{url}[/]", title="Starting"))
+
+    if open_browser:
+        import threading, webbrowser
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+
+    uvicorn.run(app, host=host, port=port, log_level="warning")
 

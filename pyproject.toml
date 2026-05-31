@@ -20,6 +20,9 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pydantic>=2.7.0",
     "pydantic-settings>=2.3.0",
+    "fastapi>=0.111.0",
+    "uvicorn>=0.29.0",
+    "sse-starlette>=2.1.0",
     "searxng @ git+https://github.com/searxng/searxng.git@main",
 ]
 
