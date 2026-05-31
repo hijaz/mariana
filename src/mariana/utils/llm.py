@@ -28,6 +28,43 @@ class _Response:
         self.content = content
 
 
+class _SimpleMessage:
+    """Minimal message object — .type and .content, no langchain dependency."""
+    __slots__ = ("type", "content")
+
+    def __init__(self, role: str, content: str):
+        self.type = role
+        self.content = content
+
+
+class SimplePrompt:
+    """
+    Drop-in replacement for ``ChatPromptTemplate`` with zero langchain deps.
+
+    Usage::
+
+        prompt = SimplePrompt([
+            ("system", "You are a {role}."),
+            ("human", "Question: {q}"),
+        ])
+        chain = prompt | llm
+        result = chain.invoke({"role": "scientist", "q": "What is fusion?"})
+    """
+
+    def __init__(self, messages: list[tuple[str, str]]):
+        self._messages = messages
+
+    def format_messages(self, **kwargs) -> list[_SimpleMessage]:
+        result = []
+        for role, template in self._messages:
+            content = template.format_map(kwargs)
+            result.append(_SimpleMessage(role, content))
+        return result
+
+    def __or__(self, other: "OllamaLLM") -> "_Chain":
+        return _Chain(self, other)
+
+
 class _Chain:
     """Result of ``prompt | OllamaLLM()``. Supports .invoke(vars)."""
     __slots__ = ("_prompt", "_llm")

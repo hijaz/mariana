@@ -10,6 +10,7 @@ from rich.console import Console
 from mariana.prompts import (
     CONCLUSION_PROMPT,
     EXEC_SUMMARY_PROMPT,
+    EXTRACT_PROMPT,
     FOLLOW_UP_PROMPT,
     QUERY_GENERATOR_PROMPT,
     SUMMARIZE_NODE_PROMPT,
@@ -35,19 +36,6 @@ console = Console()
 
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 150
-
-# Inline — spec defines these variables (section_title / domain / content)
-from langchain_core.prompts import ChatPromptTemplate as _CPT
-EXTRACT_PROMPT = _CPT.from_messages([
-    ("system",
-     "Read the source and extract the single most relevant fact or "
-     "insight that relates to the section topic. "
-     "One sentence only. Be specific — name entities, numbers, dates. "
-     "If the source is not relevant, output: NOT RELEVANT"),
-    ("human",
-     "Section: {section_title}\n"
-     "Source ({domain}):\n{content}"),
-])
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────
 

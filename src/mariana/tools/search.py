@@ -9,7 +9,6 @@ from urllib.parse import urlparse
 
 import httpx
 import trafilatura
-from langchain.tools import tool
 from markdownify import markdownify
 from readability import Document
 
@@ -288,9 +287,9 @@ def filter_for_diversity(
     return filtered
 
 
-# ── LangChain tools (kept for optional agent use) ─────────────────────────────
+# ── Search tools (plain functions; no LangChain agent dependency) ───────────────────
 
-@tool
+
 def searxng_search(query: str) -> str:
     "Search the web using local SearXNG instance. Args: query: search query"
     cfg = load_config()
@@ -303,7 +302,6 @@ def searxng_search(query: str) -> str:
     return "\n\n".join(formatted)
 
 
-@tool
 def scrape_page(url: str) -> str:
     "Fetch and extract text content from a URL. Args: url: target URL"
     cfg = load_config()
