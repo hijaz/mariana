@@ -48,6 +48,24 @@ class ResearchGoal:
             "max_depth": self.max_depth,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "ResearchGoal":
+        if not data:
+            return cls()
+        runtime = None
+        if data.get("max_runtime_seconds") is not None:
+            runtime = timedelta(seconds=data["max_runtime_seconds"])
+        return cls(
+            max_runtime=runtime,
+            max_sources=data.get("max_sources"),
+            target_words=data.get("target_words"),
+            required_topics=list(data.get("required_topics", [])) if data.get("required_topics") is not None else [],
+            max_iterations=data.get("max_iterations"),
+            min_sections=data.get("min_sections", 3),
+            max_sections=data.get("max_sections", 4),
+            max_depth=data.get("max_depth", 2),
+        )
+
 
 def _parse_duration(s: str | None) -> timedelta | None:
     """Parse a duration string like '2h', '30m', '1h30m' into a timedelta."""
