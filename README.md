@@ -51,9 +51,33 @@ MARIANA_SEARCH_DELAY_SECONDS=2.0
 
 ## Usage
 
+Run a research session with the default settings:
+
 ```bash
 python -m mariana research "What is LangGraph?"
 ```
+
+### Goal-driven research
+
+Mariana now supports runtime and quality goals so you can stop a run when it reaches a limit or covers required topics.
+
+Example:
+
+```bash
+python -m mariana research "What is fusion energy?" \
+  --for 1h \
+  --sources 10 \
+  --words 2500 \
+  --require "safety challenges" \
+  --require "existing pilot plants"
+```
+
+Flags:
+
+- `--for <duration>` — stop after the given time, e.g. `30m`, `1h`, `1h30m`
+- `--sources <n>` — stop after scraping `n` sources
+- `--words <n>` — stop when the report has written at least `n` words
+- `--require <topic>` — require coverage of one or more topics before stopping; can be passed multiple times
 
 To inspect current settings:
 
@@ -74,3 +98,4 @@ PYTHONPATH=src python -m pytest -q
 
 - The CLI performs a preflight check for Ollama connectivity and model availability.
 - If the configured model is not available locally, it prints the available models and helps you pull the right one.
+- Research results are now persisted to a local SQLite document store under the configured output directory.

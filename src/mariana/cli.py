@@ -12,7 +12,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from mariana.graph import get_graph
-from mariana.state import SubQuestion, initial_state
+from mariana.state import ResearchGoal, SubQuestion, initial_state
 from mariana.utils.config import load_config, save_setting
 from mariana.utils.llm import check_ollama, get_planner_llm, get_summarizer_llm
 from mariana.utils.searxng import SearXNGManager
@@ -22,7 +22,9 @@ NODE_LABELS = {
     "plan":      "Orchestrating outline",
     "search":    "Searching & scraping",
     "summarize": "Summarizing sources",
+    "save":      "Saving to store",
     "reflect":   "Reflecting on coverage",
+    "check":     "Checking completion",
     "report":    "Writing report",
 }
 
@@ -114,16 +116,27 @@ def _print_session_summary(state: dict, elapsed: float, report_path: Path | None
     table.add_row("Authority sources", str(authority_count))
     table.add_row("LLM calls", str(llm_calls))
     table.add_row("Total time", f"{elapsed:.0f}s")
+    if state.get("stop_reason"):
+        table.add_row("Stopped because", state["stop_reason"])
     if report_path:
         table.add_row("Report", str(report_path))
     console.print(Panel(table, title="Session Summary", border_style="dim"))
 
 
-def _run_query(query: str, cfg, fresh: bool = False):
+def _run_query(query: str, cfg, fresh: bool = False, goal: ResearchGoal | None = None):
     console.print(Panel(f"[blue]Research started:[/] {query}", title="Mariana"))
-    console.print(f"[white]Iterations:[/] {cfg.max_iterations}  "
+    g = goal or ResearchGoal.from_cli()
+    console.print(f"[white]Iterations:[/] {g.max_iterations}  "
                   f"[white]Results/question:[/] {cfg.max_results}  "
                   f"[white]Delay:[/] {cfg.search_delay_seconds:.1f}s")
+    if g.required_topics:
+        console.print(f"[white]Required topics:[/] {', '.join(g.required_topics)}")
+    if g.max_runtime:
+        console.print(f"[white]Max runtime:[/] {g.max_runtime}")
+    if g.target_words:
+        console.print(f"[white]Target words:[/] {g.target_words}")
+    if g.max_sources:
+        console.print(f"[white]Max sources:[/] {g.max_sources}")
     start = time.time()
 
     thread_id = _query_thread_id(query)
@@ -136,7 +149,7 @@ def _run_query(query: str, cfg, fresh: bool = False):
     final_state: dict = {}
 
     try:
-        for event in graph.stream(initial_state(query), config=run_config, stream_mode="updates"):
+        for event in graph.stream(initial_state(query, goal=g), config=run_config, stream_mode="updates"):
             for node_name, node_output in event.items():
                 label = NODE_LABELS.get(node_name, node_name)
                 node_status = node_output.get("status", "")
@@ -184,10 +197,25 @@ def cli():
 @click.option("--model", default=None, help="Override Ollama model")
 @click.option("--iterations", default=None, type=int, help="Max research iterations")
 @click.option("--fresh", is_flag=True, default=False, help="Ignore saved checkpoint and start fresh")
-def research(query, model, iterations, fresh):
+@click.option("--for", "duration", default=None,
+              help="Run until time limit, e.g. 30m, 2h, 1h30m")
+@click.option("--sources", default=None, type=int,
+              help="Stop after scraping this many sources")
+@click.option("--words", default=None, type=int,
+              help="Stop after writing this many words")
+@click.option("--require", multiple=True,
+              help="Required topic(s) to cover before stopping (can repeat)")
+def research(query, model, iterations, fresh, duration, sources, words, require):
     "Run deep research on a question and save a Markdown report."
     cfg, _ = _preflight(model=model, iterations=iterations)
-    _run_query(query, cfg, fresh=fresh)
+    goal = ResearchGoal.from_cli(
+        duration=duration,
+        max_sources=sources,
+        target_words=words,
+        max_iterations=iterations,
+        required_topics=require,
+    )
+    _run_query(query, cfg, fresh=fresh, goal=goal)
 
 
 @cli.command()

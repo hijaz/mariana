@@ -17,14 +17,22 @@ from mariana.prompts import (
     PLANNER_PROMPT,
     REPORT_PROMPT,
     SECTION_PROMPT,
+    SUMMARIZE_NODE_PROMPT,
     SYNTHESIZE_PROMPT,
 )
-from mariana.state import SearchResult, SubQuestion
+from mariana.state import ResearchGoal, SearchResult, SubQuestion
 from mariana.tools.search import filter_for_diversity, raw_scrape, raw_search
 from mariana.utils.config import ensure_output_dir, load_config
 from mariana.utils.llm import get_planner_llm, get_summarizer_llm, truncate_for_llm
 from mariana.utils.report import write_partial_report
 from mariana.utils.retry import with_llm_retry
+from mariana.utils.store import (
+    create_toc_node,
+    get_toc,
+    save_section_content,
+    update_node_status,
+    update_node_summary,
+)
 
 console = Console()
 
@@ -523,6 +531,11 @@ def search_node(state: dict) -> dict:
         "scraped_urls": scraped_urls,
         "used_queries": used_queries,
         "session_domain_counts": session_domain_counts,
+        "consecutive_empty_searches": (
+            state.get("consecutive_empty_searches", 0) + 1
+            if all(not sq.results for sq in updated_questions if isinstance(sq, SubQuestion) and not sq.answered)
+            else 0
+        ),
         "status": "Search complete",
     }
 
@@ -699,5 +712,155 @@ def report_node(state: dict) -> dict:
         "final_report": report,
         "llm_call_count": llm_calls,
         "status": f"Report saved to {filepath}",
+    }
+
+
+# ── Helper: generate a one-sentence node summary ─────────────────────────────
+
+def _generate_node_summary(title: str, text: str) -> str:
+    """Generate a short summary sentence for a completed section."""
+    try:
+        chain = SUMMARIZE_NODE_PROMPT | get_summarizer_llm()
+        result = chain.invoke({"title": title, "text": text[:1200]})
+        return getattr(result, "content", "").strip()
+    except Exception:
+        return text[:80].replace("\n", " ")
+
+
+# ── save_to_store_node ────────────────────────────────────────────────────────
+
+def save_to_store_node(state: dict) -> dict:
+    """
+    Persist completed sub-question sections to the SQLite document store.
+    Creates toc_nodes for new sections, saves content, and generates summaries.
+    """
+    doc_id = state.get("doc_id", "")
+    if not doc_id:
+        return {}
+
+    sub_questions = state.get("sub_questions", [])
+    llm_calls = state.get("llm_call_count", 0)
+    total_words = state.get("total_words_written", 0)
+    total_sources = state.get("total_sources_scraped", 0)
+
+    # Build a map of existing toc_nodes for this document
+    existing_toc = {n["title"]: n for n in get_toc(doc_id)}
+
+    answered_count = 0
+    for idx, sq in enumerate(sub_questions):
+        if not isinstance(sq, SubQuestion) or not sq.answered or not sq.summary:
+            continue
+
+        title = sq.question
+        if title not in existing_toc:
+            node_id = create_toc_node(doc_id, title, depth=0, order_index=idx)
+        else:
+            node_id = existing_toc[title]["id"]
+
+        save_section_content(node_id, sq.summary)
+        update_node_status(node_id, "complete")
+
+        # Generate and store node summary
+        summary_text = _generate_node_summary(title, sq.summary)
+        update_node_summary(node_id, summary_text)
+        llm_calls += 1
+
+        word_count = len(sq.summary.split())
+        total_words += word_count
+        answered_count += 1
+        console.print(f"  [dim]Saved section:[/] {title[:55]} ({word_count}w)")
+
+    # Count scraped sources
+    total_sources = sum(
+        1
+        for sq in sub_questions
+        if isinstance(sq, SubQuestion)
+        for r in sq.results
+        if r.url
+    )
+
+    return {
+        "llm_call_count": llm_calls,
+        "total_words_written": total_words,
+        "total_sources_scraped": total_sources,
+        "status": f"Saved {answered_count} section(s) to store",
+    }
+
+
+# ── check_completion_node ─────────────────────────────────────────────────────
+
+def check_completion_node(state: dict) -> dict:
+    """
+    Evaluate stopping conditions from ResearchGoal and set should_stop / stop_reason.
+    Also checks required_topics via tree_search if any are specified.
+    """
+    from datetime import datetime, timedelta
+
+    from mariana.utils.retrieval import check_required_topics
+
+    goal_config = state.get("goal_config") or {}
+    doc_id = state.get("doc_id", "")
+
+    # Reconstruct limits from goal_config dict
+    max_runtime_sec = goal_config.get("max_runtime_seconds")
+    max_sources     = goal_config.get("max_sources")
+    target_words    = goal_config.get("target_words")
+    required_topics = goal_config.get("required_topics") or []
+    max_iterations  = goal_config.get("max_iterations")
+
+    started_at_str  = state.get("started_at", "")
+    iteration       = state.get("iteration", 0)
+    total_sources   = state.get("total_sources_scraped", 0)
+    total_words     = state.get("total_words_written", 0)
+    consec_empty    = state.get("consecutive_empty_searches", 0)
+
+    reason = ""
+
+    # 1. Runtime check
+    if max_runtime_sec and started_at_str:
+        try:
+            started = datetime.fromisoformat(started_at_str)
+            elapsed = (datetime.now() - started).total_seconds()
+            if elapsed >= max_runtime_sec:
+                reason = f"runtime limit reached ({elapsed:.0f}s / {max_runtime_sec:.0f}s)"
+        except ValueError:
+            pass
+
+    # 2. Source count check
+    if not reason and max_sources and total_sources >= max_sources:
+        reason = f"source limit reached ({total_sources}/{max_sources})"
+
+    # 3. Word count target
+    if not reason and target_words and total_words >= target_words:
+        reason = f"word target reached ({total_words}/{target_words})"
+
+    # 4. Iteration ceiling
+    if not reason and max_iterations and iteration >= max_iterations:
+        reason = f"iteration limit reached ({iteration}/{max_iterations})"
+
+    # 5. Required topics
+    if not reason and required_topics and doc_id:
+        llm = get_planner_llm()
+        unanswered = check_required_topics(doc_id, required_topics, llm)
+        if not unanswered:
+            reason = "all required topics covered"
+        else:
+            console.print(
+                f"[blue]Required topics outstanding:[/] {', '.join(unanswered)}"
+            )
+
+    # 6. Consecutive empty searches safety valve
+    if not reason and consec_empty >= 5:
+        reason = "5 consecutive searches returned no usable content"
+
+    if reason:
+        console.print(f"[blue]Stopping:[/] {reason}")
+    else:
+        console.print("[blue]Completion check:[/] continuing research")
+
+    return {
+        "should_stop": bool(reason),
+        "stop_reason": reason,
+        "status": f"Completion check: {'stop' if reason else 'continue'}",
     }
 

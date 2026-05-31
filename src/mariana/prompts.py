@@ -119,6 +119,16 @@ CONCLUSION_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "Topic: {query}\n\nFindings summary:\n{findings}"),
 ])
 
+SUMMARIZE_NODE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Write a single sentence (max 20 words) summarising the KEY FINDING "
+     "in the text below. Be specific — include a concrete fact, number, or "
+     "mechanism if present. No filler like 'this section covers'."),
+    ("human",
+     "Section: {title}\n\n"
+     "Text:\n{text}"),
+])
+
 QUERY_GENERATOR_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "Generate exactly {n} search queries to research the given topic.\n"
